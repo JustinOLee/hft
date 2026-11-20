@@ -1,3 +1,12 @@
 /target
 *.log
 .DS_Store
+
+# Secrets: this repo is PUBLIC. Never commit keys or account details.
+.env
+.env.*
+*.key
+*.pem
+secrets/
+*.secret.*
+config.local.*
