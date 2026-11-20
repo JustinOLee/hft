@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde_json = "1.0.154"
+tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+webpki-roots = { version = "1.0.12", default-features = false }
