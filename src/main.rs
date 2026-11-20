@@ -1,55 +1,86 @@
-//! Plan step 1: connect to Hyperliquid and log all traffic to a file.
+//! Plan step 2: networking on one thread, state machine on another,
+//! connected only through the log file.
 //!
-//! Usage: cargo run -- [log_path] [coin]
-//!   defaults: capture.log BTC
+//!   network thread:  Hyperliquid  ──►  logs/<time>.log   (appends events)
+//!   main thread:     logs/<time>.log  ──►  sm.update(event)  ──►  prints mid
 //!
-//! Everything runs on one thread with blocking I/O: no async, no threads.
+//! Usage: cargo run -- [coin] [log_path]
+//!   defaults: BTC logs/<unix seconds>.log
 
+mod event;
 mod eventlog;
+mod sm;
+mod tail;
 mod ws;
+
+use std::thread;
 
 use serde_json::json;
 use tungstenite::Message;
 
+use event::Event;
 use eventlog::EventLog;
+use sm::StateMachine;
+use tail::Tailer;
 
-/// "Any error at all", boxed. Fine for now; we'll get more precise later.
-pub type Error = Box<dyn std::error::Error>;
+/// "Any error at all", boxed. `Send + Sync` lets errors cross between threads.
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const HOST: &str = "api.hyperliquid.xyz";
 const WS_PATH: &str = "/ws";
 
 fn main() -> Result<(), Error> {
     let args: Vec<String> = std::env::args().collect();
-    let log_path = args.get(1).map(String::as_str).unwrap_or("capture.log");
-    let coin = args.get(2).map(String::as_str).unwrap_or("BTC");
-
-    let mut log = EventLog::open(log_path)?;
-    log.write(0, "start", json!({ "coin": coin }))?;
+    let coin = args.get(1).cloned().unwrap_or_else(|| "BTC".to_string());
+    let log_path = match args.get(2) {
+        Some(p) => p.clone(),
+        None => {
+            std::fs::create_dir_all("logs")?;
+            format!("logs/{}.log", eventlog::now_nanos() / 1_000_000_000)
+        }
+    };
     eprintln!("logging to {log_path}");
+
+    // Create the file BEFORE starting either thread, so the reader can't try
+    // to open it before it exists.
+    let log = EventLog::create(&log_path)?;
+
+    // `move` gives the closure ownership of `log` and `coin`. Exactly one
+    // thread owns the writer, so Rust can prove no two threads write at once.
+    thread::spawn(move || {
+        if let Err(e) = run_network(log, &coin) {
+            eprintln!("network thread stopped: {e}");
+        }
+    });
+
+    let mut tailer = Tailer::open(&log_path, true)?;
+    let mut sm = StateMachine::new();
+    while let Some(line) = tailer.next_line()? {
+        let ev = Event::parse(&line)?;
+        sm.update(&ev);
+    }
+    Ok(())
+}
+
+/// Step 1's code, unchanged except that it now runs on its own thread.
+fn run_network(mut log: EventLog, coin: &str) -> Result<(), Error> {
+    log.write(0, "start", json!({ "coin": coin }))?;
 
     let conn = 1; // our first (and for now only) connection
     let mut ws = ws::connect(&mut log, conn, HOST, WS_PATH)?;
 
-    // Hyperliquid subscriptions: the full order book (top 20 levels per side,
-    // re-sent on every change) and the stream of public trades.
-    for sub in ["l2Book", "trades"] {
+    // Hyperliquid subscriptions:
+    //   l2Book  full snapshot of the book's depth, but only every ~12 s
+    //   bbo     best bid/ask, sent whenever they change (~every 100 ms)
+    //   trades  every public trade
+    for sub in ["l2Book", "bbo", "trades"] {
         let msg = json!({ "method": "subscribe", "subscription": { "type": sub, "coin": coin } });
         ws::send_text(&mut ws, &mut log, conn, &msg.to_string())?;
     }
 
-    // Blocking read loop: `ws.read()` waits until a whole websocket message has
-    // arrived (however many TCP reads that takes), then returns it.
-    let mut count: u64 = 0;
     loop {
         match ws.read() {
-            Ok(Message::Text(text)) => {
-                log.write(conn, "ws_in", json!(text.as_str()))?;
-                count += 1;
-                if count % 100 == 0 {
-                    eprintln!("{count} messages");
-                }
-            }
+            Ok(Message::Text(text)) => log.write(conn, "ws_in", json!(text.as_str()))?,
             // tungstenite answers pings with pongs automatically.
             Ok(Message::Ping(p)) => log.write(conn, "ws_ping", json!(p.len()))?,
             Ok(Message::Pong(p)) => log.write(conn, "ws_pong", json!(p.len()))?,

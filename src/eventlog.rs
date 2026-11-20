@@ -22,9 +22,10 @@ pub struct EventLog {
 }
 
 impl EventLog {
-    /// Open (or create) the log file in append mode.
-    pub fn open(path: &str) -> io::Result<EventLog> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+    /// Create a NEW log file. Fails if the file already exists: one file per
+    /// session, so we never mix two sessions together by accident.
+    pub fn create(path: &str) -> io::Result<EventLog> {
+        let file = OpenOptions::new().create_new(true).append(true).open(path)?;
         Ok(EventLog { file })
     }
 
@@ -47,7 +48,7 @@ impl EventLog {
 /// Nanoseconds since 1970-01-01. This is the ONLY place the program reads the
 /// clock. Everything downstream must use the `ts` stored in the event instead,
 /// or replays won't be deterministic (plan step 3).
-fn now_nanos() -> u64 {
+pub fn now_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is before 1970")
