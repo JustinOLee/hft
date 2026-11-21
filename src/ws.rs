@@ -25,7 +25,31 @@ pub type TlsStream = StreamOwned<ClientConnection, TcpStream>;
 /// A websocket running on top of that.
 pub type Ws = WebSocket<TlsStream>;
 
-pub fn connect(log: &mut EventLog, conn: u64, host: &str, path: &str) -> Result<Ws, Error> {
+/// An extra HTTP header for the upgrade request.
+pub struct Header {
+    pub name: String,
+    pub value: String,
+    /// Secret values are replaced with "<redacted>" in the log. The log is
+    /// a record of what happened, and must never become a credential store.
+    pub secret: bool,
+}
+
+impl Header {
+    pub fn public(name: &str, value: &str) -> Header {
+        Header { name: name.into(), value: value.into(), secret: false }
+    }
+    pub fn secret(name: &str, value: &str) -> Header {
+        Header { name: name.into(), value: value.into(), secret: true }
+    }
+}
+
+pub fn connect(
+    log: &mut EventLog,
+    conn: u64,
+    host: &str,
+    path: &str,
+    headers: &[Header],
+) -> Result<Ws, Error> {
     // ---- TCP ---------------------------------------------------------------
     log.write(conn, "tcp_connect", json!({ "host": host, "port": 443 }))?;
     let tcp = TcpStream::connect((host, 443))?;
@@ -67,16 +91,26 @@ pub fn connect(log: &mut EventLog, conn: u64, host: &str, path: &str) -> Result<
     // A websocket starts life as an ordinary HTTP GET with special headers.
     // The random key lets us check that the server really speaks websocket.
     let key = generate_key();
-    let request = format!(
-        "GET {path} HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Key: {key}\r\n\
-         Sec-WebSocket-Version: 13\r\n\
-         \r\n"
-    );
-    log.write(conn, "http_request", json!(request))?; // log BEFORE sending
+    // Build the request twice: the real one, and a copy for the log with
+    // secret header values blanked out.
+    let build = |redact: bool| {
+        let mut req = format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: {key}\r\n\
+             Sec-WebSocket-Version: 13\r\n"
+        );
+        for h in headers {
+            let value = if redact && h.secret { "<redacted>" } else { h.value.as_str() };
+            req.push_str(&format!("{}: {}\r\n", h.name, value));
+        }
+        req.push_str("\r\n");
+        req
+    };
+    let request = build(false);
+    log.write(conn, "http_request", json!(build(true)))?; // log BEFORE sending
     tls.write_all(request.as_bytes())?;
     tls.flush()?;
 
@@ -99,7 +133,21 @@ pub fn connect(log: &mut EventLog, conn: u64, host: &str, path: &str) -> Result<
 
     // 101 Switching Protocols = "OK, this connection is a websocket now".
     if !head.starts_with("HTTP/1.1 101") {
-        return Err(format!("websocket upgrade refused: {}", head.lines().next().unwrap_or("")).into());
+        // A refusal usually explains itself in a short body. Content-Length
+        // says exactly how many bytes it is (Lesson 1's framing rule #1).
+        let len: usize = header(&head, "content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mut body = buf[header_end..].to_vec();
+        while body.len() < len.min(64 * 1024) {
+            let n = tls.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        let body = String::from_utf8_lossy(&body).into_owned();
+        log.write(conn, "http_response_body", json!(body))?;
+        let status = head.lines().next().unwrap_or("");
+        return Err(format!("websocket upgrade refused: {status} {body}").into());
     }
     let expected = derive_accept_key(key.as_bytes());
     if header(&head, "sec-websocket-accept") != Some(expected.as_str()) {

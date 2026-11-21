@@ -3,13 +3,15 @@
 //! The golden rule: `update` may only use (a) the event it is given and
 //! (b) its own fields. No clock, no network, no randomness. Then the same
 //! sequence of events always produces the same state and the same output,
-//! which is what makes replay (plan step 3) possible.
+//! which is what makes replay possible.
 
 use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+use crate::book::{Book, Side};
 use crate::event::{Event, Kind};
+use crate::fixed::{self, parse_price, parse_qty, Price};
 
 /// Where a connection is in its life. Mirrors the layers in ws.rs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,58 +24,18 @@ pub enum ConnState {
     Closed,
 }
 
-/// One price level: everyone's orders at a single price, added together.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Level {
-    // NOTE: f64 is fine for printing a mid price. Before we place orders we
-    // will switch to exact integer prices, because 0.1 + 0.2 != 0.3 in
-    // floating point, and exchanges reject prices that are off by a hair.
-    pub px: f64,
-    pub sz: f64,
-    /// Number of separate orders making up this level.
-    pub n: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct Book {
-    /// Exchange's timestamp for this snapshot, in milliseconds.
-    pub exch_time: u64,
-    /// Best (highest) bid first.
-    pub bids: Vec<Level>,
-    /// Best (lowest) ask first.
-    pub asks: Vec<Level>,
-}
-
-/// Top of the book: just the best bid and best ask.
-///
-/// Two feeds tell us about it. `bbo` updates whenever the best prices change
-/// (about every 100 ms for BTC). `l2Book` carries depth but arrives only
-/// every ~12 s. Whichever has the newer exchange time wins.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Top {
-    /// Exchange's timestamp, in milliseconds.
-    pub exch_time: u64,
-    /// Either side can be missing if nobody is quoting it.
-    pub bid: Option<Level>,
-    pub ask: Option<Level>,
-}
-
-impl Top {
-    /// Midpoint between the best bid and best ask, if both sides exist.
-    pub fn mid(&self) -> Option<f64> {
-        Some((self.bid.as_ref()?.px + self.ask.as_ref()?.px) / 2.0)
-    }
-}
-
 #[derive(Default)]
 pub struct StateMachine {
-    /// BTreeMap rather than HashMap: a HashMap's iteration order is randomized
-    /// per run, a classic way to accidentally break determinism.
+    /// BTreeMap rather than HashMap everywhere: a HashMap's iteration order
+    /// is randomized per run, a classic way to break determinism.
     pub conns: BTreeMap<u64, ConnState>,
-    /// Depth, from l2Book. Its top levels can be up to ~12 s stale.
-    pub book: Option<Book>,
-    /// Best bid/ask, from whichever feed is fresher.
-    pub top: Option<Top>,
+    /// Order books by market ticker. A market is only here while we trust
+    /// its book: from its snapshot until a gap or disconnect.
+    pub books: BTreeMap<String, Book>,
+    /// Last sequence number seen per subscription id ("sid").
+    seqs: BTreeMap<u64, u64>,
+    /// Last printed (bid, ask) per market, to print only on change.
+    last_top: BTreeMap<String, (Option<Price>, Option<Price>)>,
     /// Timestamp of the latest event seen. This is the state machine's "now".
     pub now: u64,
 }
@@ -96,11 +58,12 @@ impl StateMachine {
             }
             Kind::WsClose | Kind::TcpClose(_) => {
                 self.set_conn(ev.conn, ConnState::Closed);
-                // With the connection gone, our copy of the book stops
-                // updating while the real one keeps moving. A stale book is
-                // worse than no book, so throw it away.
-                self.book = None;
-                self.top = None;
+                // Subscriptions don't survive a reconnect, and with the feed
+                // gone our books stop updating while the real ones keep
+                // moving. A stale book is worse than no book.
+                self.books.clear();
+                self.seqs.clear();
+                self.print_changes();
             }
             Kind::WsIn(text) => self.on_message(text),
             Kind::Start | Kind::WsOut(_) | Kind::Other(_) => {}
@@ -114,85 +77,159 @@ impl StateMachine {
     fn on_message(&mut self, text: &str) {
         let msg: Value = match serde_json::from_str(text) {
             Ok(v) => v,
-            Err(e) => {
-                eprintln!("{} bad json: {e}", self.now);
+            Err(e) => return self.warn(&format!("bad json: {e}")),
+        };
+
+        // Sequence check. Messages on a subscription are numbered 1, 2, 3...
+        // If we see 5 after 3, message 4 was lost and anything built from
+        // that subscription can no longer be trusted.
+        if let (Some(sid), Some(seq)) = (msg["sid"].as_u64(), msg["seq"].as_u64()) {
+            let expected = self.seqs.get(&sid).map(|last| last + 1);
+            self.seqs.insert(sid, seq);
+            if expected.is_some_and(|e| e != seq) {
+                self.warn(&format!("sequence gap on sid {sid}: expected {expected:?}, got {seq}"));
+                // We don't track which markets belong to which sid yet, so
+                // distrust every book. Each market comes back with its next
+                // snapshot. TODO(step 4): ask the network thread to request
+                // fresh snapshots (update_subscription / get_snapshot).
+                self.books.clear();
+                self.print_changes();
                 return;
             }
-        };
-        match msg["channel"].as_str() {
-            Some("l2Book") => match parse_book(&msg["data"]) {
-                Some(book) => {
-                    let top = Top {
-                        exch_time: book.exch_time,
-                        bid: book.bids.first().cloned(),
-                        ask: book.asks.first().cloned(),
-                    };
-                    // Each l2Book message is a complete snapshot, so we simply
-                    // replace the old book rather than applying changes.
-                    self.book = Some(book);
-                    self.set_top(top);
-                }
-                None => eprintln!("{} malformed l2Book message", self.now),
-            },
-            Some("bbo") => match parse_bbo(&msg["data"]) {
-                Some(top) => self.set_top(top),
-                None => eprintln!("{} malformed bbo message", self.now),
-            },
-            // trades, subscriptionResponse, ...: not used yet.
+        }
+
+        match msg["type"].as_str() {
+            Some("orderbook_snapshot") => self.on_snapshot(&msg["msg"]),
+            Some("orderbook_delta") => self.on_delta(&msg["msg"]),
+            Some("error") => self.warn(&format!("exchange error: {}", msg["msg"])),
+            // subscribed, ok, trade, ticker...: not used yet. Kalshi may add
+            // new message types at any time; ignoring unknown ones is
+            // intentional (their docs ask for it).
             _ => {}
         }
     }
 
-    /// Accept a new top of book unless we already have a newer one, and print
-    /// the mid whenever it changes.
-    fn set_top(&mut self, top: Top) {
-        if let Some(current) = &self.top {
-            if top.exch_time < current.exch_time {
-                return; // older than what we have: ignore it
+    fn on_snapshot(&mut self, m: &Value) {
+        let Some(ticker) = m["market_ticker"].as_str() else {
+            return self.warn("snapshot without market_ticker");
+        };
+        // A side with no orders is left out of the message entirely.
+        let side = |key: &str| match m.get(key) {
+            None => Some(Vec::new()),
+            Some(v) => parse_levels(v),
+        };
+        match (side("yes_dollars_fp"), side("no_dollars_fp")) {
+            (Some(yes), Some(no)) => {
+                self.books.insert(ticker.to_string(), Book::from_snapshot(yes, no));
+                self.print_changes();
             }
+            _ => self.warn(&format!("malformed snapshot for {ticker}")),
         }
-        let old_mid = self.top.as_ref().and_then(Top::mid);
-        let new_mid = top.mid();
-        self.top = Some(top);
-        if new_mid != old_mid {
-            if let Some(mid) = new_mid {
-                println!("{} {}", self.now, mid);
+    }
+
+    fn on_delta(&mut self, m: &Value) {
+        let parsed = (|| {
+            let ticker = m["market_ticker"].as_str()?;
+            let price = parse_price(m["price_dollars"].as_str()?)?;
+            let delta = parse_qty(m["delta_fp"].as_str()?)?;
+            let side = match m["side"].as_str()? {
+                "yes" => Side::Yes,
+                "no" => Side::No,
+                _ => return None,
+            };
+            Some((ticker, side, price, delta))
+        })();
+        let Some((ticker, side, price, delta)) = parsed else {
+            return self.warn(&format!("malformed delta: {m}"));
+        };
+        // No book (we never got its snapshot, or threw it away): ignore.
+        let Some(book) = self.books.get_mut(ticker) else { return };
+        if !book.apply_delta(side, price, delta) {
+            self.warn(&format!("{ticker}: delta made a level negative; dropping book"));
+            self.books.remove(ticker);
+        }
+        self.print_changes();
+    }
+
+    /// Print "<ts> <ticker> <bid> <ask> <mid>" for every market whose best
+    /// prices changed since we last printed it ("-" = no price).
+    fn print_changes(&mut self) {
+        // Markets that lost their book need a line too, so check both sets.
+        let mut tickers: Vec<String> = self.books.keys().cloned().collect();
+        tickers.extend(self.last_top.keys().filter(|t| !self.books.contains_key(*t)).cloned());
+        tickers.sort();
+        for ticker in tickers {
+            let book = self.books.get(&ticker);
+            let bid = book.and_then(Book::best_bid).map(|(p, _)| p);
+            let ask = book.and_then(Book::best_ask).map(|(p, _)| p);
+            if self.last_top.get(&ticker) == Some(&(bid, ask)) {
+                continue;
             }
+            self.last_top.insert(ticker.clone(), (bid, ask));
+            let show = |p: Option<Price>| p.map(fixed::format_price).unwrap_or("-".into());
+            // The mid can fall between two price units ($0.565), so compute
+            // it with one more decimal place to keep it exact.
+            let mid = match (bid, ask) {
+                (Some(b), Some(a)) => fixed::format((b + a) * 5, fixed::PRICE_DECIMALS + 1),
+                _ => "-".into(),
+            };
+            println!("{} {ticker} {} {} {mid}", self.now, show(bid), show(ask));
         }
+    }
+
+    fn warn(&self, what: &str) {
+        eprintln!("{} WARN {what}", self.now);
     }
 }
 
-/// Parse `{"coin":..,"time":..,"levels":[[bids...],[asks...]]}`.
-/// Returns None if anything is missing or malformed.
-fn parse_book(data: &Value) -> Option<Book> {
-    let exch_time = data["time"].as_u64()?;
-    let sides = data["levels"].as_array()?;
-    let bids = parse_levels(sides.first()?)?;
-    let asks = parse_levels(sides.get(1)?)?;
-    Some(Book { exch_time, bids, asks })
+/// Parse `[["0.0800", "300.00"], ...]` into (price, quantity) pairs.
+fn parse_levels(v: &Value) -> Option<Vec<(Price, i64)>> {
+    v.as_array()?
+        .iter()
+        .map(|level| Some((parse_price(level[0].as_str()?)?, parse_qty(level[1].as_str()?)?)))
+        .collect()
 }
 
-/// Parse `{"coin":..,"time":..,"bbo":[bid or null, ask or null]}`.
-fn parse_bbo(data: &Value) -> Option<Top> {
-    let exch_time = data["time"].as_u64()?;
-    let sides = data["bbo"].as_array()?;
-    // `null` means nobody is quoting that side. That's a valid state, but
-    // a level that's present and malformed is an error.
-    let side = |v: &Value| if v.is_null() { Some(None) } else { parse_level(v).map(Some) };
-    Some(Top { exch_time, bid: side(sides.first()?)?, ask: side(sides.get(1)?)? })
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn parse_levels(side: &Value) -> Option<Vec<Level>> {
-    // A list of Options becomes one Option: None if any level failed.
-    side.as_array()?.iter().map(parse_level).collect()
-}
+    fn ws_in(ts: u64, json: &str) -> Event {
+        Event { ts, conn: 1, kind: Kind::WsIn(json.to_string()) }
+    }
 
-fn parse_level(l: &Value) -> Option<Level> {
-    Some(Level {
-        // Prices and sizes arrive as strings ("59093.0") so no precision
-        // is lost in transit; we parse them ourselves.
-        px: l["px"].as_str()?.parse().ok()?,
-        sz: l["sz"].as_str()?.parse().ok()?,
-        n: l["n"].as_u64()?,
-    })
+    const SNAP: &str = r#"{"type":"orderbook_snapshot","sid":1,"seq":1,"msg":{"market_ticker":"T","yes_dollars_fp":[["0.5500","10.00"],["0.5600","3.00"]],"no_dollars_fp":[["0.4300","2.00"]]}}"#;
+
+    #[test]
+    fn snapshot_then_delta() {
+        let mut sm = StateMachine::new();
+        sm.update(&ws_in(1, SNAP));
+        let b = &sm.books["T"];
+        assert_eq!(b.best_bid(), Some((5600, 300)));
+        assert_eq!(b.best_ask(), Some((5700, 200)));
+
+        sm.update(&ws_in(2, r#"{"type":"orderbook_delta","sid":1,"seq":2,"msg":{"market_ticker":"T","price_dollars":"0.5600","delta_fp":"-3.00","side":"yes"}}"#));
+        assert_eq!(sm.books["T"].best_bid(), Some((5500, 1000)));
+    }
+
+    #[test]
+    fn gap_drops_books_until_next_snapshot() {
+        let mut sm = StateMachine::new();
+        sm.update(&ws_in(1, SNAP));
+        // seq jumps from 1 to 3: message 2 was lost.
+        sm.update(&ws_in(2, r#"{"type":"orderbook_delta","sid":1,"seq":3,"msg":{"market_ticker":"T","price_dollars":"0.5600","delta_fp":"-3.00","side":"yes"}}"#));
+        assert!(sm.books.is_empty());
+        // A fresh snapshot (here with the next seq) restores it.
+        sm.update(&ws_in(3, &SNAP.replace(r#""seq":1"#, r#""seq":4"#)));
+        assert!(sm.books.contains_key("T"));
+    }
+
+    #[test]
+    fn disconnect_drops_everything() {
+        let mut sm = StateMachine::new();
+        sm.update(&ws_in(1, SNAP));
+        sm.update(&Event { ts: 2, conn: 1, kind: Kind::TcpClose("bye".into()) });
+        assert!(sm.books.is_empty());
+        assert_eq!(sm.conns[&1], ConnState::Closed);
+    }
 }
