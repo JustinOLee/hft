@@ -42,7 +42,8 @@ use tungstenite::protocol::Role as WsRole;
 use tungstenite::{Message, WebSocket};
 
 use crate::action::Action;
-use crate::eventlog::{self, EventLog};
+use crate::eventlog;
+use crate::queue::EventWriter;
 use crate::http::{find_from, header_value, parse_response};
 use crate::kalshi::{self, Credentials};
 use crate::net::{self, Header};
@@ -126,7 +127,7 @@ struct RestRequest {
 
 pub struct Reactor {
     poll: Poll,
-    log: EventLog,
+    log: Box<dyn EventWriter>,
     creds: Credentials,
     tls_config: Arc<ClientConfig>,
     subscriptions: Vec<Value>,
@@ -153,7 +154,7 @@ impl Reactor {
     /// Build the reactor. Returns a `Waker` the state machine thread uses
     /// to interrupt the reactor's wait when it has queued an action.
     pub fn new(
-        log: EventLog,
+        log: Box<dyn EventWriter>,
         creds: Credentials,
         tickers: &[String],
         actions: Receiver<Action>,
@@ -323,7 +324,7 @@ impl Reactor {
     /// Make all the progress we can on one connection. Any error closes it.
     fn drive_conn(&mut self, role: Role) -> Result<(), Error> {
         let Some(mut conn) = self.slot(role).take() else { return Ok(()) };
-        match drive(&mut conn, &mut self.log) {
+        match drive(&mut conn, self.log.as_mut()) {
             Ok(progress) => {
                 *self.slot(role) = Some(conn);
                 if progress.ws_opened {
@@ -510,7 +511,7 @@ fn is_would_block(e: &tungstenite::Error) -> bool {
 }
 
 /// Advance one connection's state machine as far as it can go right now.
-fn drive(conn: &mut Conn, log: &mut EventLog) -> Result<Progress, Error> {
+fn drive(conn: &mut Conn, log: &mut dyn EventWriter) -> Result<Progress, Error> {
     let mut progress = Progress::default();
     loop {
         match &conn.phase {
@@ -589,7 +590,7 @@ fn drive(conn: &mut Conn, log: &mut EventLog) -> Result<Progress, Error> {
 }
 
 /// Send the websocket upgrade request (a normal HTTP GET with extra headers).
-fn send_upgrade(conn: &mut Conn, log: &mut EventLog) -> Result<String, Error> {
+fn send_upgrade(conn: &mut Conn, log: &mut dyn EventWriter) -> Result<String, Error> {
     let key = generate_key();
     let host = conn.host;
     let headers = std::mem::take(&mut conn.upgrade_headers);
@@ -609,7 +610,7 @@ fn send_upgrade(conn: &mut Conn, log: &mut EventLog) -> Result<String, Error> {
     Ok(key)
 }
 
-fn drive_ws(conn: &mut Conn, log: &mut EventLog) -> Result<(), Error> {
+fn drive_ws(conn: &mut Conn, log: &mut dyn EventWriter) -> Result<(), Error> {
     let Some(Transport::Ws(ws)) = conn.transport.as_mut() else { return Ok(()) };
     loop {
         match ws.read() {
@@ -633,7 +634,7 @@ fn drive_ws(conn: &mut Conn, log: &mut EventLog) -> Result<(), Error> {
 }
 
 /// Read and log every complete response that has arrived. Returns how many.
-fn drive_rest(conn: &mut Conn, log: &mut EventLog) -> Result<usize, Error> {
+fn drive_rest(conn: &mut Conn, log: &mut dyn EventWriter) -> Result<usize, Error> {
     flush_tls(conn.tls())?;
     let read = read_into_inbuf(conn);
     // Log whatever complete responses arrived, even if the server then

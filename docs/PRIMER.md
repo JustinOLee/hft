@@ -587,6 +587,49 @@ cargo run -- replay --check-actions logs/<file>.log
 
 ---
 
+## Step 9: A queue between the threads
+
+**Files:** `src/queue.rs` (new), `src/tail.rs`
+
+**What it does:** the two threads now talk only through two small
+**interfaces** (Rust calls them **traits**):
+
+```
+network thread ──[EventWriter]──► the log ──[EventReader]──► state machine
+state machine  ──[ActionSink]─────────────────────────────►  network thread
+```
+
+A trait is a promise: "any type that implements `EventWriter` has a `write`
+method." The reactor only knows it has *some* `EventWriter`. Today that's the
+log file. Tomorrow it could be something much faster, and the reactor and
+state machine wouldn't need to change at all.
+
+**The faster version, for later.** `queue.rs` has a TODO describing how to
+build your own version of **Chronicle Queue**, a well-known open-source
+queue: share memory between the threads instead of going through the disk,
+store events in a compact binary format instead of JSON, and have the reader
+watch a counter that the writer bumps after each event. That makes a hop
+take well under a microsecond, and replay still works because the shared
+memory is backed by a file.
+
+**A small experiment: busy-polling.** Step 8 showed our internal delay was
+1 to 3 ms, mostly because the file reader slept 1 ms whenever it caught up.
+Real trading systems **busy-poll**: a thread checks for new data in a tight
+loop and never sleeps. That's fast, but it keeps a CPU core 100% busy. We
+did a middle ground: spin for 100 ms after the last new data, then go back
+to sleeping.
+
+| | Sleep 1 ms (step 8) | Spin while active (step 9) |
+|---|---|---|
+| place: trigger → network thread | 3.4 ms | **0.35 ms** |
+| cancel: trigger → network thread | 1.4 ms | **0.15 ms** |
+| CPU use | – | about 2.5% of one core |
+
+**10 times faster** for almost no CPU. Our own delay is now tiny next to the
+~45 ms of network travel to Kalshi.
+
+---
+
 ## Where we are
 
 | Plan step | Status |
@@ -599,7 +642,86 @@ cargo run -- replay --check-actions logs/<file>.log
 | 6. Look at what we have | ✅ |
 | 7. A proper network loop | ✅ |
 | 8. Measure waiting time | ✅ (Mac version; see below) |
-| 9. A real queue between the threads | ⏳ next |
+| 9. A queue between the threads | ✅ |
+| 10. Market making | ⏳ next, after your review |
+
+## Review guide: a good place to stop and dig in
+
+Parts 1 to 3 of the plan are done: a small, solid trading system that can
+watch markets, place and cancel real orders, survive disconnects, and replay
+any session exactly. Part 4 (an actual strategy) builds on all of it, so this
+is the best moment for a deep review.
+
+**Size:** about 2,800 lines of Rust in 13 files, 25 automatic tests.
+
+### Suggested reading order
+
+Read top to bottom. Each file builds on the ones above it.
+
+| # | File | Lines | What to look for |
+|---|---|---|---|
+| 1 | `src/eventlog.rs` | 56 | one line per event, written immediately; the only place the clock is read |
+| 2 | `src/event.rs` | 82 | turning a log line back into a Rust `enum` |
+| 3 | `src/fixed.rs` | 107 | exact prices as whole numbers; read the tests at the bottom |
+| 4 | `src/book.rs` | 100 | YES and NO bids; `best_ask = $1 − best NO bid` |
+| 5 | `src/action.rs` | 64 | the three things the state machine can ask for |
+| 6 | `src/sm.rs` | 751 | **the heart.** `update()` at the top; the place-cancel strategy near the bottom; tests at the very end |
+| 7 | `src/queue.rs`, `src/tail.rs` | 139 | the interfaces between threads; reading a growing file |
+| 8 | `src/kalshi.rs` | 207 | signing requests; turning actions into REST calls |
+| 9 | `src/http.rs` | 306 | HTTP framing (`parse_response`); tests with 3-byte reads |
+| 10 | `src/net.rs` | 84 | TCP + TLS for the simple blocking tool |
+| 11 | `src/reactor.rs` | 659 | **the event loop.** `run()` first, then `drive()` |
+| 12 | `src/main.rs` | 252 | the commands; how the two threads are wired together |
+
+### Things to try yourself
+
+```
+cargo test                                        # all 25 tests
+cargo run -- balance                              # one signed request
+cargo run -- live <TICKER>                        # watch a market (Ctrl-C to stop)
+cargo run -- live --test-disconnect <TICKER>      # watch it reconnect after 10 s
+cargo run -- replay logs/<file>.log               # replay any session
+cargo run -- replay --check-actions logs/<file>.log
+scripts/check_replay.sh 60 --place-cancel <TICKER>   # real order: place, cancel, verify
+python3 scripts/latency.py logs/<file>.log        # where the time goes
+```
+
+To find an active market: look on kalshi.com, or ask me. The ticker is in
+the market's URL.
+
+### Questions worth asking while you read
+
+- In `sm.rs`, where could a bug make the program think it has no order when
+  it really has one? (Hint: what happens to orders from a *previous* run?)
+- In `reactor.rs`, what happens if Kalshi is slow to answer an order and the
+  state machine sends a second one?
+- Why does `update()` return actions instead of sending them itself?
+- What would break if two threads both wrote to the log?
+
+### Known limitations (honest list)
+
+| Limitation | Why it matters | When to fix |
+|---|---|---|
+| **Orders from earlier runs are invisible.** On startup we don't ask Kalshi which orders are already open | a crashed run could leave an order resting | before step 10 |
+| **Open orders aren't canceled on exit or crash** | same as above | before step 10 |
+| No fills or position tracking yet (fills are printed, not counted) | a strategy needs to know what it holds | step 10 |
+| A sequence gap on the private order feed only prints a warning | an order update could be missed | step 10/11 |
+| Kernel timestamps don't work on macOS | can't measure exactly when packets arrive | on a Linux machine |
+| DNS lookups block the event loop briefly | only when (re)connecting | later |
+| The event queue is still a file | 0.15–0.35 ms per hop | later (Chronicle-style queue) |
+| Only Ed25519 API keys are supported | RSA keys from Kalshi won't load | if ever needed |
+
+### What's next: step 10, market making
+
+Quote a bid and an ask around the mid on one market, with a maximum
+position and the "lean" from PLAN.md. That's the first strategy that will
+actually trade (and could lose money), so first:
+1. On startup, load open orders and positions from Kalshi, and on exit,
+   cancel everything (the first two limitations above).
+2. Track fills and our position in the state machine.
+3. Pick the market and limits together: spread, size, maximum position.
+
+---
 
 ## Words to know
 

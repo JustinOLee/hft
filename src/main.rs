@@ -26,6 +26,7 @@ mod fixed;
 mod http;
 mod kalshi;
 mod net;
+mod queue;
 mod reactor;
 mod sm;
 mod tail;
@@ -38,11 +39,10 @@ use std::time::Duration;
 use serde_json::json;
 
 use action::Action;
-use event::Event;
 use eventlog::EventLog;
 use kalshi::Credentials;
 use sm::{StateMachine, Strategy, REST_CONN};
-use tail::Tailer;
+use queue::{EventReader, FileReader};
 
 /// "Any error at all", boxed. `Send + Sync` lets errors cross between threads.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -101,7 +101,7 @@ struct RunResult {
 /// The same function serves live and replay; only the tailer differs.
 /// Stops at end of file (replay) or when the strategy is finished.
 fn run_state_machine(
-    mut tailer: Tailer,
+    mut events: impl EventReader,
     actions_tx: Option<ActionSink>,
     strategy_override: Option<Strategy>,
 ) -> Result<RunResult, Error> {
@@ -110,8 +110,7 @@ fn run_state_machine(
         None => StateMachine::new(),
     };
     let mut result = RunResult { emitted: Vec::new(), logged: Vec::new() };
-    while let Some(line) = tailer.next_line()? {
-        let ev = Event::parse(&line)?;
+    while let Some(ev) = events.next_event()? {
         if let event::Kind::Action(a) = &ev.kind {
             result.logged.push((ev.ts, a.clone()));
         }
@@ -137,7 +136,7 @@ fn run_state_machine(
 /// With `check_actions`, also compare the actions this replay produced with
 /// the ones the live run logged. They must be identical (plan step 5).
 fn replay(log_path: &str, check_actions: bool, strategy: Option<Strategy>) -> Result<(), Error> {
-    let r = run_state_machine(Tailer::open(log_path, false)?, None, strategy)?;
+    let r = run_state_machine(FileReader::open(log_path, false)?, None, strategy)?;
     if !check_actions {
         return Ok(());
     }
@@ -179,8 +178,10 @@ fn new_log(prefix: &str) -> Result<(EventLog, String), Error> {
     Ok((EventLog::create(&path)?, path))
 }
 
-/// Sends actions to the network thread, and wakes it so it doesn't wait for
-/// its next timeout before noticing.
+/// The action queue (state machine -> network thread): an in-memory channel,
+/// plus a wake-up so the reactor doesn't wait for its next timeout before
+/// noticing. Actions still reach the log, because the reactor writes each
+/// one down before carrying it out.
 struct ActionSink {
     tx: Sender<Action>,
     waker: Arc<mio::Waker>,
@@ -214,7 +215,7 @@ fn live(opts: Options) -> Result<(), Error> {
 
     // A channel is a queue between threads: `tx` sends, `rx` receives.
     let (tx, rx) = mpsc::channel::<Action>();
-    let (reactor, waker) = reactor::Reactor::new(log, creds, &opts.tickers, rx, opts.test_disconnect)?;
+    let (reactor, waker) = reactor::Reactor::new(Box::new(log), creds, &opts.tickers, rx, opts.test_disconnect)?;
 
     // `move` gives the closure ownership of everything it uses. Exactly one
     // thread owns the log writer, so Rust can prove no two threads write at
@@ -226,7 +227,7 @@ fn live(opts: Options) -> Result<(), Error> {
     });
 
     let sink = ActionSink { tx, waker };
-    run_state_machine(Tailer::open(&log_path, true)?, Some(sink), None)?;
+    run_state_machine(FileReader::open(&log_path, true)?, Some(sink), None)?;
     // Give the network thread a moment to log the last actions it was sent.
     thread::sleep(Duration::from_millis(500));
     Ok(())
