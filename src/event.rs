@@ -22,6 +22,7 @@ pub struct Event {
 /// What happened. An `enum` in Rust is a type that is exactly one of several
 /// variants, and each variant can carry its own data.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // some payloads aren't read yet; later steps use them
 pub enum Kind {
     Start,
     TcpConnect,

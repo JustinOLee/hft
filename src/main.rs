@@ -1,11 +1,16 @@
-//! Plan step 2: networking on one thread, state machine on another,
-//! connected only through the log file.
+//! Networking on one thread, state machine on another, connected only
+//! through the log file.
 //!
 //!   network thread:  Hyperliquid  ──►  logs/<time>.log   (appends events)
 //!   main thread:     logs/<time>.log  ──►  sm.update(event)  ──►  prints mid
 //!
-//! Usage: cargo run -- [coin] [log_path]
-//!   defaults: BTC logs/<unix seconds>.log
+//! Usage:
+//!   cargo run -- live [coin] [log_path]   defaults: BTC logs/<unix seconds>.log
+//!   cargo run -- replay <log_path>
+//!
+//! Replay runs only the main thread's half, over a finished file. Because the
+//! state machine depends on nothing but the events, replaying a session must
+//! print exactly what the live run printed (plan step 3).
 
 mod event;
 mod eventlog;
@@ -29,11 +34,38 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 const HOST: &str = "api.hyperliquid.xyz";
 const WS_PATH: &str = "/ws";
 
+const USAGE: &str = "usage: hft live [coin] [log_path] | hft replay <log_path>";
+
 fn main() -> Result<(), Error> {
     let args: Vec<String> = std::env::args().collect();
-    let coin = args.get(1).cloned().unwrap_or_else(|| "BTC".to_string());
-    let log_path = match args.get(2) {
-        Some(p) => p.clone(),
+    match args.get(1).map(String::as_str) {
+        Some("live") => live(args.get(2).cloned(), args.get(3).cloned()),
+        Some("replay") => replay(args.get(2).ok_or(USAGE)?),
+        _ => Err(USAGE.into()),
+    }
+}
+
+/// Feed every line from the tailer into a fresh state machine.
+/// The same function serves live and replay; only the tailer differs.
+fn run_state_machine(mut tailer: Tailer) -> Result<(), Error> {
+    let mut sm = StateMachine::new();
+    while let Some(line) = tailer.next_line()? {
+        let ev = Event::parse(&line)?;
+        sm.update(&ev);
+    }
+    Ok(())
+}
+
+/// Replay: read a finished log from start to end. No network, no threads.
+fn replay(log_path: &str) -> Result<(), Error> {
+    run_state_machine(Tailer::open(log_path, false)?)
+}
+
+/// Live: network thread writes the log while the main thread follows it.
+fn live(coin: Option<String>, log_path: Option<String>) -> Result<(), Error> {
+    let coin = coin.unwrap_or_else(|| "BTC".to_string());
+    let log_path = match log_path {
+        Some(p) => p,
         None => {
             std::fs::create_dir_all("logs")?;
             format!("logs/{}.log", eventlog::now_nanos() / 1_000_000_000)
@@ -53,13 +85,7 @@ fn main() -> Result<(), Error> {
         }
     });
 
-    let mut tailer = Tailer::open(&log_path, true)?;
-    let mut sm = StateMachine::new();
-    while let Some(line) = tailer.next_line()? {
-        let ev = Event::parse(&line)?;
-        sm.update(&ev);
-    }
-    Ok(())
+    run_state_machine(Tailer::open(&log_path, true)?)
 }
 
 /// Step 1's code, unchanged except that it now runs on its own thread.
