@@ -38,6 +38,9 @@ pub enum Kind {
     HttpError(String),
     /// An action the network thread is about to carry out.
     Action(Action),
+    /// Once a second, from the network loop: lets the state machine act
+    /// even when no messages arrive.
+    Timer,
     WsOut(String),
     WsIn(String),
     WsClose,
@@ -66,6 +69,7 @@ impl Event {
             "http_response" => Kind::HttpResponse(text()),
             "http_response_body" => Kind::HttpResponseBody(text()),
             "http_error" => Kind::HttpError(text()),
+            "timer" => Kind::Timer,
             "action" => Kind::Action(serde_json::from_value(v["data"].clone())?),
             "ws_out" => Kind::WsOut(text()),
             "ws_in" => Kind::WsIn(text()),

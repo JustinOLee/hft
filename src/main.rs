@@ -2,10 +2,12 @@
 //!
 //!   network thread:  Kalshi  ──►  logs/<time>.log   (appends events)
 //!   main thread:     logs/<time>.log  ──►  sm.update(event)  ──►  actions
-//!   actions:         main thread  ──(channel)──►  network thread  ──►  Kalshi
+//!   actions:         main thread  ──(channel + wake)──►  network thread  ──►  Kalshi
+//!
+//! The network thread is an event loop ("reactor", see reactor.rs).
 //!
 //! Usage:
-//!   cargo run -- live [--test-resync] [--place-cancel] <TICKER> [TICKER...]
+//!   cargo run -- live [--test-resync] [--place-cancel] [--test-disconnect] <TICKER>...
 //!   cargo run -- replay [--check-actions] [--place-cancel] <log_path>
 //!   cargo run -- balance            (one signed REST request, for testing)
 //!
@@ -24,28 +26,28 @@ mod fixed;
 mod http;
 mod kalshi;
 mod net;
+mod reactor;
 mod sm;
 mod tail;
-mod ws;
 
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use serde_json::json;
-use tungstenite::Message;
 
 use action::Action;
 use event::Event;
 use eventlog::EventLog;
 use kalshi::Credentials;
-use sm::{StateMachine, Strategy, REST_CONN, WS_CONN};
+use sm::{StateMachine, Strategy, REST_CONN};
 use tail::Tailer;
 
 /// "Any error at all", boxed. `Send + Sync` lets errors cross between threads.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-const USAGE: &str = "usage: hft live [--test-resync] [--place-cancel] <TICKER> [TICKER...]\n       \
+const USAGE: &str = "usage: hft live [--test-resync] [--place-cancel] [--test-disconnect] <TICKER>...\n       \
                      hft replay [--check-actions] [--place-cancel] <log_path>\n       hft balance";
 
 /// Session settings chosen on the command line.
@@ -53,6 +55,8 @@ struct Options {
     tickers: Vec<String>,
     test_resync: bool,
     place_cancel: bool,
+    /// Testing aid: force one websocket disconnect this long after it opens.
+    test_disconnect: Option<Duration>,
 }
 
 fn main() -> Result<(), Error> {
@@ -63,6 +67,7 @@ fn main() -> Result<(), Error> {
                 tickers: args[1..].iter().filter(|a| !a.starts_with("--")).cloned().collect(),
                 test_resync: args.iter().any(|a| a == "--test-resync"),
                 place_cancel: args.iter().any(|a| a == "--place-cancel"),
+                test_disconnect: args.iter().any(|a| a == "--test-disconnect").then(|| Duration::from_secs(10)),
             };
             if opts.tickers.is_empty() {
                 return Err(USAGE.into());
@@ -95,7 +100,7 @@ struct RunResult {
 /// Stops at end of file (replay) or when the strategy is finished.
 fn run_state_machine(
     mut tailer: Tailer,
-    actions_tx: Option<Sender<Action>>,
+    actions_tx: Option<ActionSink>,
     strategy_override: Option<Strategy>,
 ) -> Result<RunResult, Error> {
     let mut sm = match strategy_override {
@@ -111,9 +116,9 @@ fn run_state_machine(
         for action in sm.update(&ev) {
             println!("{} ACTION {}", sm.now, serde_json::to_string(&action)?);
             result.emitted.push(action.clone());
-            if let Some(tx) = &actions_tx {
-                if tx.send(action).is_err() {
-                    eprintln!("{} WARN network thread is gone; action dropped", sm.now);
+            if let Some(sink) = &actions_tx {
+                if let Err(e) = sink.send(action) {
+                    eprintln!("{} WARN action dropped: {e}", sm.now);
                 }
             }
         }
@@ -165,133 +170,56 @@ fn new_log(prefix: &str) -> Result<(EventLog, String), Error> {
     Ok((EventLog::create(&path)?, path))
 }
 
+/// Sends actions to the network thread, and wakes it so it doesn't wait for
+/// its next timeout before noticing.
+struct ActionSink {
+    tx: Sender<Action>,
+    waker: Arc<mio::Waker>,
+}
+
+impl ActionSink {
+    fn send(&self, action: Action) -> Result<(), Error> {
+        self.tx.send(action).map_err(|_| "network thread is gone")?;
+        self.waker.wake()?;
+        Ok(())
+    }
+}
+
 /// Live: network thread writes the log while the main thread follows it.
 fn live(opts: Options) -> Result<(), Error> {
     let creds = load_credentials()?;
     // Create the file BEFORE starting either thread, so the reader can't try
     // to open it before it exists.
-    let (log, log_path) = new_log("")?;
+    let (mut log, log_path) = new_log("")?;
     eprintln!("{:?} environment, logging to {log_path}", creds.env);
 
-    // A channel is a queue between threads: `tx` sends, `rx` receives.
-    let (tx, rx) = mpsc::channel::<Action>();
-
-    // `move` gives the closure ownership of everything it uses. Exactly one
-    // thread owns the log writer, so Rust can prove no two threads write at
-    // once.
-    thread::spawn(move || {
-        if let Err(e) = run_network(log, &creds, &opts, rx) {
-            eprintln!("network thread stopped: {e}");
-        }
-    });
-
-    run_state_machine(Tailer::open(&log_path, true)?, Some(tx), None)?;
-    // Give the network thread a moment to log the last actions it was sent.
-    thread::sleep(Duration::from_millis(500));
-    Ok(())
-}
-
-fn run_network(mut log: EventLog, creds: &Credentials, opts: &Options, actions: Receiver<Action>) -> Result<(), Error> {
-    let tickers = &opts.tickers;
     // Everything the state machine needs to know about this session goes in
     // the first event, so replay sees exactly the same settings.
     let start = json!({
         "env": format!("{:?}", creds.env),
-        "tickers": tickers,
+        "tickers": opts.tickers,
         "test_resync": opts.test_resync,
         "strategy": if opts.place_cancel { "place_cancel" } else { "none" },
     });
     log.write(0, "start", start)?;
 
-    // Sign the websocket upgrade. Reading the clock here is fine: this is
-    // the network edge, not the state machine.
-    let headers = creds.auth_headers(now_ms(), "GET", kalshi::WS_PATH);
-    let mut ws = ws::connect(&mut log, WS_CONN, creds.env.ws_host(), kalshi::WS_PATH, &headers)?;
+    // A channel is a queue between threads: `tx` sends, `rx` receives.
+    let (tx, rx) = mpsc::channel::<Action>();
+    let (reactor, waker) = reactor::Reactor::new(log, creds, &opts.tickers, rx, opts.test_disconnect)?;
 
-    // Public order books for our markets, plus two private channels about
-    // our own orders: status changes (user_orders) and trades (fill).
-    let subscriptions = [
-        json!({ "channels": ["orderbook_delta"], "market_tickers": tickers }),
-        json!({ "channels": ["user_orders"] }),
-        json!({ "channels": ["fill"] }),
-    ];
-    // Kalshi wants a unique id on every command we send on a connection.
-    let mut next_id = 1;
-    for params in subscriptions {
-        let cmd = json!({ "id": next_id, "cmd": "subscribe", "params": params });
-        next_id += 1;
-        ws::send_text(&mut ws, &mut log, WS_CONN, &cmd.to_string())?;
-    }
-
-    // Don't block on the websocket forever: we also need to check for actions.
-    ws::set_read_timeout(&mut ws, Duration::from_millis(5))?;
-    let mut rest = http::Client::new(creds.env.rest_host(), REST_CONN);
-
-    loop {
-        // 1. Anything from Kalshi? (waits at most 5 ms)
-        match ws.read() {
-            Ok(Message::Text(text)) => log.write(WS_CONN, "ws_in", json!(text.as_str()))?,
-            // Kalshi pings after 10 s without data; tungstenite answers
-            // with a pong automatically.
-            Ok(Message::Ping(p)) => log.write(WS_CONN, "ws_ping", json!(p.len()))?,
-            Ok(Message::Pong(p)) => log.write(WS_CONN, "ws_pong", json!(p.len()))?,
-            Ok(Message::Binary(b)) => log.write(WS_CONN, "ws_in_binary", json!(b.len()))?,
-            Ok(Message::Close(frame)) => log.write(WS_CONN, "ws_close", json!(format!("{frame:?}")))?,
-            Ok(Message::Frame(_)) => {} // only produced when writing raw frames
-            Err(e) if ws::is_timeout(&e) => {} // nothing arrived: fine
-            Err(tungstenite::Error::ConnectionClosed) => {
-                log.write(WS_CONN, "tcp_close", json!("closed"))?;
-                return Ok(());
-            }
-            Err(e) => {
-                log.write(WS_CONN, "tcp_close", json!(e.to_string()))?;
-                return Err(e.into());
-            }
+    // `move` gives the closure ownership of everything it uses. Exactly one
+    // thread owns the log writer, so Rust can prove no two threads write at
+    // once.
+    thread::spawn(move || {
+        if let Err(e) = reactor.run() {
+            eprintln!("network thread stopped: {e}");
         }
+    });
 
-        // 2. Anything the state machine wants done?
-        loop {
-            match actions.try_recv() {
-                Ok(action) => execute(&mut log, creds, &mut ws, &mut rest, &mut next_id, &action)?,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Ok(()), // state machine finished
-            }
-        }
-    }
-}
-
-/// Carry out one action: log it first, then do it.
-fn execute(
-    log: &mut EventLog,
-    creds: &Credentials,
-    ws: &mut ws::Ws,
-    rest: &mut http::Client,
-    next_id: &mut u64,
-    action: &Action,
-) -> Result<(), Error> {
-    log.write(0, "action", serde_json::to_value(action)?)?;
-
-    if let Action::Resync { sid, tickers } = action {
-        let cmd = json!({
-            "id": *next_id,
-            "cmd": "update_subscription",
-            "params": { "sids": [sid], "market_tickers": tickers, "action": "get_snapshot" },
-        });
-        *next_id += 1;
-        return ws::send_text(ws, log, WS_CONN, &cmd.to_string());
-    }
-
-    let Some(call) = kalshi::rest_call(action) else { return Ok(()) };
-    // Every REST request is signed separately. The query string isn't signed.
-    let headers = creds.auth_headers(now_ms(), call.method, &call.path);
-    let path = format!("{}{}", call.path, call.query);
-    // NOTE: this blocks the websocket for one round trip (~tens of ms).
-    // Acceptable for now; step 7's event loop fixes it.
-    if let Err(e) = rest.request(log, call.method, &path, &headers, call.body.as_deref()) {
-        // The state machine must hear about every REST action exactly once:
-        // either a response body or this.
-        log.write(REST_CONN, "http_error", json!(e.to_string()))?;
-    }
+    let sink = ActionSink { tx, waker };
+    run_state_machine(Tailer::open(&log_path, true)?, Some(sink), None)?;
+    // Give the network thread a moment to log the last actions it was sent.
+    thread::sleep(Duration::from_millis(500));
     Ok(())
 }
 

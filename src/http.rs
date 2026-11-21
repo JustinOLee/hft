@@ -33,55 +33,59 @@ impl Response {
     }
 }
 
-/// Read up to and including the blank line ending the headers. Bytes after
-/// it stay in `buf`: they belong to the body (or the next protocol).
-pub fn read_head<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<(u16, String), Error> {
-    loop {
-        if let Some(i) = find_from(buf, 0, b"\r\n\r\n") {
-            let head = String::from_utf8_lossy(&buf[..i + 4]).into_owned();
-            buf.drain(..i + 4);
-            // Status line: "HTTP/1.1 201 Created"
-            let status = head
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| format!("bad status line: {:?}", head.lines().next()))?;
-            return Ok((status, head));
-        }
-        fill(r, buf)?;
-    }
-}
+/// Try to parse one complete response from the start of `buf`.
+///
+/// Ok(None)            = not all here yet: read more bytes and call again.
+/// Ok(Some((resp, n))) = done; the response used the first n bytes of `buf`
+///                       (anything after belongs to the next response).
+///
+/// A pure function on a buffer: it never reads from the network itself, so
+/// the same code works for blocking and non-blocking connections.
+pub fn parse_response(buf: &[u8]) -> Result<Option<(Response, usize)>, Error> {
+    let Some(i) = find_from(buf, 0, b"\r\n\r\n") else { return Ok(None) };
+    let head_len = i + 4;
+    let head = String::from_utf8_lossy(&buf[..head_len]).into_owned();
+    // Status line: "HTTP/1.1 201 Created"
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("bad status line: {:?}", head.lines().next()))?;
+    let rest = &buf[head_len..];
 
-/// Read the body that follows `head`, consuming exactly its bytes from `buf`.
-pub fn read_body<R: Read>(r: &mut R, buf: &mut Vec<u8>, status: u16, head: &str) -> Result<Vec<u8>, Error> {
     // These statuses never have a body, whatever the headers say.
     if status == 204 || status == 304 || (100..200).contains(&status) {
-        return Ok(Vec::new());
+        return Ok(Some((Response { status, head, body: Vec::new() }, head_len)));
     }
-    let chunked = header_value(head, "transfer-encoding")
+    let chunked = header_value(&head, "transfer-encoding")
         .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
     if chunked {
-        loop {
-            if let Some((body, used)) = decode_chunked(buf)? {
-                buf.drain(..used);
-                return Ok(body);
-            }
-            fill(r, buf)?;
-        }
+        return Ok(decode_chunked(rest)?.map(|(body, n)| (Response { status, head, body }, head_len + n)));
     }
-    if let Some(len) = header_value(head, "content-length") {
-        let len: usize = len.parse().map_err(|_| format!("bad Content-Length {len:?}"))?;
-        while buf.len() < len {
-            fill(r, buf)?;
-        }
-        return Ok(buf.drain(..len).collect());
+    let Some(len) = header_value(&head, "content-length") else {
+        // Legal HTTP ("read until the server hangs up"), but useless on a
+        // keep-alive connection, and Kalshi never does it.
+        return Err("response has neither Content-Length nor chunked encoding".into());
+    };
+    let len: usize = len.parse().map_err(|_| format!("bad Content-Length {len:?}"))?;
+    if rest.len() < len {
+        return Ok(None);
     }
-    // Neither: the body runs until the server closes the connection.
-    let mut chunk = [0u8; 4096];
+    let body = rest[..len].to_vec();
+    Ok(Some((Response { status, head, body }, head_len + len)))
+}
+
+/// Blocking version: read from `r` until one whole response is in `buf`.
+pub fn read_response<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<Response, Error> {
     loop {
+        if let Some((resp, used)) = parse_response(buf)? {
+            buf.drain(..used);
+            return Ok(resp);
+        }
+        let mut chunk = [0u8; 4096];
         let n = r.read(&mut chunk)?;
         if n == 0 {
-            return Ok(std::mem::take(buf));
+            return Err("connection closed in the middle of a response".into());
         }
         buf.extend_from_slice(&chunk[..n]);
     }
@@ -120,17 +124,6 @@ fn decode_chunked(buf: &[u8]) -> Result<Option<(Vec<u8>, usize)>, Error> {
         }
         pos += size + 2;
     }
-}
-
-/// Read some more bytes onto the end of `buf`.
-fn fill<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<(), Error> {
-    let mut chunk = [0u8; 4096];
-    let n = r.read(&mut chunk)?;
-    if n == 0 {
-        return Err("connection closed in the middle of a response".into());
-    }
-    buf.extend_from_slice(&chunk[..n]);
-    Ok(())
 }
 
 /// Position of `needle` in `haystack` at or after `from`.
@@ -200,9 +193,7 @@ impl Client {
             let tls = self.tls.as_mut().expect("connected above");
             tls.write_all(build(false).as_bytes())?;
             tls.flush()?;
-            let (status, head) = read_head(tls, &mut self.buf)?;
-            let body = read_body(tls, &mut self.buf, status, &head)?;
-            Ok::<_, Error>(Response { status, head, body })
+            read_response(tls, &mut self.buf)
         })();
 
         match result {
@@ -257,9 +248,8 @@ mod tests {
     }
 
     fn read_one(r: &mut Trickle, buf: &mut Vec<u8>) -> (u16, String) {
-        let (status, head) = read_head(r, buf).unwrap();
-        let body = read_body(r, buf, status, &head).unwrap();
-        (status, String::from_utf8(body).unwrap())
+        let resp = read_response(r, buf).unwrap();
+        (resp.status, resp.body_text())
     }
 
     #[test]
@@ -288,6 +278,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_incrementally() {
+        let full = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}NEXT";
+        // Every prefix shorter than the whole response is "not yet".
+        for n in 0..full.len() - 4 {
+            assert!(parse_response(&full[..n]).unwrap().is_none(), "prefix {n}");
+        }
+        let (resp, used) = parse_response(full).unwrap().unwrap();
+        assert_eq!((resp.status, resp.body_text().as_str(), used), (200, "{}", full.len() - 4));
+        assert!(parse_response(b"HTTP/1.1 200 OK\r\n\r\nbody").is_err()); // no length
+    }
+
+    #[test]
     fn chunked_needs_more_data() {
         assert!(decode_chunked(b"5\r\nhel").unwrap().is_none());
         assert!(decode_chunked(b"5\r\nhello\r\n0\r\n").unwrap().is_none());
@@ -299,7 +301,6 @@ mod tests {
     fn connection_closed_mid_response_is_an_error() {
         let mut r = trickle("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort");
         let mut buf = Vec::new();
-        let (status, head) = read_head(&mut r, &mut buf).unwrap();
-        assert!(read_body(&mut r, &mut buf, status, &head).is_err());
+        assert!(read_response(&mut r, &mut buf).is_err());
     }
 }

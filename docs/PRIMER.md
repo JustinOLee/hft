@@ -437,6 +437,112 @@ packets in  →  state machine  →  packets out
 
 ---
 
+## Step 7: A proper network loop (the "reactor")
+
+**Files:** `src/reactor.rs` (new, replaces the old network code), `src/http.rs`
+
+**The problem:** the old network thread used three hacks:
+- it waited up to 5 ms on the websocket, then checked for actions, over and over
+- while an order request was out, it couldn't read the websocket at all
+- if a connection dropped, it just stopped
+
+**The fix: an event loop.** One loop, one thread, that never waits on any
+single thing:
+
+```
+loop:
+    ask the operating system "which connections have something for me?"
+        (sleep until one does, OR the next timer tick, OR the state
+         machine wakes us up because it has an action)
+    for each ready connection: read everything, write what we can
+    send any actions the state machine queued
+    every second: write a "timer" event
+    reconnect anything that dropped
+```
+
+This design is called the **reactor pattern**. "Ask the operating system" is
+a feature called **kqueue** on Mac and **epoll** on Linux. The `mio` library
+gives both one interface.
+
+**New ideas in this step:**
+
+- **Non-blocking sockets.** A read with nothing to read returns the error
+  `WouldBlock` right away instead of waiting. That "error" is normal. It
+  just means "nothing yet, come back later".
+- **Edge-triggered.** The operating system tells us once when a connection
+  *becomes* ready. So every time we touch a connection we read until
+  `WouldBlock`. Otherwise leftover data could sit there with no second
+  reminder.
+- **Each connection is its own little state machine:**
+  ```
+  TcpConnecting → TlsHandshaking → (websocket only: Upgrading) → Open
+  ```
+  Each time the operating system says a connection is ready, we move it
+  forward as far as it can go without waiting.
+- **The waker.** When the state machine sends an action, it also "wakes" the
+  reactor, so the action goes out immediately instead of at the next timeout.
+- **The timer.** Every second the reactor writes a `timer` event to the log.
+  The state machine can use it to act when the market is quiet. Because it
+  goes in the log, replay sees the same ticks.
+- **Reconnecting with backoff.** If a connection drops, wait 1 second and
+  reconnect. If that fails, wait 2, then 4, 8 and so on up to 30 seconds.
+  Hammering a struggling server makes things worse, and Kalshi turns away
+  clients that reconnect too fast. After reconnecting we subscribe again,
+  because subscriptions don't survive a reconnect.
+- **HTTP framing as a pure function.** `parse_response(bytes)` answers either
+  "here's a complete response, and it used N bytes" or "not complete yet".
+  It never reads from the network itself, so the reactor and the simple
+  `hft balance` tool share the same code and tests.
+
+**Something the logs taught us.** The first run showed this line:
+```
+10.248s  conn2  tcp_close  connection closed by server
+```
+**Kalshi closes a REST connection after 10 seconds without a request.** That
+hides a real danger: if we send an order at the exact moment Kalshi hangs up,
+we get an error and **don't know whether the order went through**. Two fixes:
+1. We replace the REST connection ourselves after 8 seconds idle, before
+   Kalshi does it. A warm connection is always ready.
+2. A new order status, **`Unknown`**: "the request failed with no reply, so
+   we don't know." The private order feed tells us the truth later. The old
+   code would have said "Rejected", which could have been false while the
+   order was actually live.
+
+**A Rust lesson: the borrow checker.** The first version didn't compile:
+`cannot borrow conn.inbuf as mutable more than once at a time`. The code tried
+to use the connection's encrypted stream and its buffer, both mutably, at the
+same time. Rust refuses two mutable references to the same thing at once,
+because that's how data races and memory corruption happen in other
+languages. The fix was to move the buffer out of the connection, use it, and
+put it back (`read_into_inbuf`).
+
+**Tests on the real exchange:**
+
+1. **Watching for 20 s:** both connections opened *side by side* (no more
+   waiting in line), 20 timer events, and Kalshi's ping was answered
+   automatically. Replay was identical.
+2. **A forced disconnect** (`--test-disconnect` drops the websocket 10 s after
+   it opens):
+   ```
+   10.14 s  websocket: tcp_close "test: forced disconnect"
+            state machine prints "- - -"  (no book: better than a stale one)
+   11.14 s  reconnect (after the 1 s backoff)
+   11.35 s  subscribed again, fresh snapshot, prices back
+   ```
+   The REST connection was recycled every 8 s throughout. Replay was
+   identical.
+3. **The real order again:**
+
+   | | Step 5 | Step 7 |
+   |---|---|---|
+   | decide to place → request sent | 130 ms (had to open a connection) | **1.3 ms** (warm connection) |
+   | place → canceled, total | 250 ms | **103 ms** |
+
+   What's left is almost all network travel: about 45 ms each way to
+   Kalshi. Balance unchanged at $20.01. Replay actions matched.
+
+---
+
 ## Where we are
 
 | Plan step | Status |
@@ -447,7 +553,8 @@ packets in  →  state machine  →  packets out
 | 4. The state machine can act | ✅ |
 | 5. Place one real order and cancel it | ✅ |
 | 6. Look at what we have | ✅ |
-| 7. A proper network loop | ⏳ next |
+| 7. A proper network loop | ✅ |
+| 8. Measure waiting time (kernel timestamps) | ⏳ next |
 
 ## Words to know
 

@@ -47,8 +47,12 @@ pub enum OrderStatus {
     Canceled,
     /// Completely filled.
     Executed,
-    /// Kalshi said no (or the request failed and we can't be sure).
+    /// Kalshi said no.
     Rejected,
+    /// The request failed without a reply (e.g. the connection dropped), so
+    /// we can't tell whether Kalshi got it. The private order feed will
+    /// tell us if it exists.
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -180,7 +184,7 @@ impl StateMachine {
             Kind::WsClose | Kind::TcpClose(_) => self.on_close(ev.conn),
             Kind::WsIn(text) => self.on_message(text),
             Kind::Action(action) => self.on_own_action(action),
-            Kind::WsOut(_) | Kind::Other(_) => {}
+            Kind::WsOut(_) | Kind::Timer | Kind::Other(_) => {}
         }
         self.run_strategy();
         std::mem::take(&mut self.out)
@@ -268,10 +272,12 @@ impl StateMachine {
                         order.order_id = Some(id.to_string());
                     }
                 }
-                if !ok {
-                    self.warn(&format!("order {cid} rejected: HTTP {status} {body} {result:?}"));
-                }
-                if !ok {
+                if result.is_err() {
+                    // No reply at all: it may or may not have gone through.
+                    self.warn(&format!("order {cid}: no reply ({result:?}); status unknown"));
+                    self.set_status(&cid, OrderStatus::Unknown);
+                } else if !ok {
+                    self.warn(&format!("order {cid} rejected: HTTP {status} {body}"));
                     self.set_status(&cid, OrderStatus::Rejected);
                 } else if self.orders.get(&cid).map(|o| o.status) == Some(OrderStatus::Pending) {
                     // Only move forward: the private feed may already have
@@ -708,6 +714,25 @@ mod tests {
     }
 
     #[test]
+    fn no_reply_means_unknown_until_the_feed_says_otherwise() {
+        let mut sm = started(&["T"]);
+        let place = Action::Place {
+            client_order_id: "c1".into(),
+            ticker: "T".into(),
+            side: OrderSide::Bid,
+            price: 100,
+            count: 100,
+            post_only: true,
+        };
+        sm.update(&ev(1, 0, Kind::Action(place)));
+        sm.update(&ev(2, REST_CONN, Kind::HttpError("connection closed by server".into())));
+        assert_eq!(sm.orders["c1"].status, OrderStatus::Unknown);
+        // It did go through after all:
+        sm.update(&ws_in(3, r#"{"type":"user_order","sid":5,"msg":{"order_id":"o9","client_order_id":"c1","status":"resting"}}"#));
+        assert_eq!(sm.orders["c1"].status, OrderStatus::Resting);
+    }
+
+    #[test]
     fn rejected_order() {
         let mut sm = started(&["T"]);
         let place = Action::Place {
@@ -719,7 +744,8 @@ mod tests {
             post_only: true,
         };
         sm.update(&ev(1, 0, Kind::Action(place)));
-        sm.update(&ev(2, REST_CONN, Kind::HttpError("connection reset".into())));
+        sm.update(&ev(2, REST_CONN, Kind::HttpResponse("HTTP/1.1 400 Bad Request\r\n\r\n".into())));
+        sm.update(&ev(3, REST_CONN, Kind::HttpResponseBody(r#"{"error":{"code":"invalid_order"}}"#.into())));
         assert_eq!(sm.orders["c1"].status, OrderStatus::Rejected);
     }
 }
