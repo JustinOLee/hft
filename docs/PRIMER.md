@@ -333,6 +333,110 @@ exactly what the live run used.
 
 ---
 
+## Step 5: The first real order
+
+**Files:** `src/sm.rs` (the `run_place_cancel` function), `src/main.rs`
+
+**What it does:** `hft live --place-cancel <TICKER>` runs a tiny strategy:
+
+1. Wait until we can see the market's order book.
+2. Place a **post-only bid for 1 YES contract at 1¢**. "Post-only" means:
+   if this order would trade immediately, reject it instead. 1¢ is far
+   below the market, so the order just sits in the book. Even in the worst
+   case it would cost one cent.
+3. When Kalshi says the order is **resting** (sitting in the book), cancel it.
+4. When Kalshi says it's **canceled**, stop.
+
+**A trap we avoided: asking twice.** After the state machine decides to
+cancel, it takes a moment for its own `cancel` action to come back through
+the log. Other events (book changes) can arrive in between. If the strategy
+only looked at "what does Kalshi say the order's status is?", it would see
+"still resting" and send another cancel, and another. So the strategy keeps
+its own note of **what it has asked for** (`Placed`, `Canceling`), which
+runs ahead of **what Kalshi has confirmed**. Remembering both is a big theme
+of trading systems.
+
+**Another trap: news arriving out of order.** Kalshi tells us about our
+order on two different connections: the REST reply ("accepted") and the
+websocket feed ("resting"). They can arrive in either order. So an order's
+status only ever moves **forward**: once we know it's resting, a late
+"accepted" doesn't drag it back.
+
+**Testing it before using real money:** `hft replay --place-cancel <old log>`
+runs the strategy on a log recorded *without* it. It printed exactly one
+`place` action and then waited (that old log never confirms the order). Good.
+
+**The real run** (Kalshi production, real account):
+
+| Time | What happened |
+|---|---|
+| 0.00 s | start |
+| 0.19 s | websocket open, subscribed to the book and to our own orders |
+| 0.24 s | state machine: **place** (buy 1 at $0.01) |
+| 0.24 to 0.37 s | open the REST connection (TCP, then TLS) |
+| 0.43 s | Kalshi: **201 Created**, here's the order ID |
+| 0.44 s | private feed: order is **resting** |
+| 0.45 s | state machine: **cancel** |
+| 0.49 s | Kalshi: **200 OK**, reduced by 1.00 |
+| 0.50 s | private feed: order is **canceled**. Done. |
+
+A whole round trip, place to cancel, took a quarter of a second. Balance
+afterwards: unchanged at $20.01.
+
+**Checking it with replay:** `hft replay --check-actions <log>` compares the
+actions the state machine produces during replay with the actions the live
+run wrote to the log. Both had exactly the same 2 actions (place, cancel),
+and the printed output was byte-for-byte identical. `scripts/check_replay.sh`
+now does both checks automatically.
+
+**What the program prints** for an order:
+```
+ACTION {"action":"place", ... "price":100,"count":100,"post_only":true}
+ORDER hft1795298319-1 KXAAAGASD-26NOV22-3.6450 Pending -
+ORDER hft1795298319-1 ... Accepted 01a2001e-...
+ORDER hft1795298319-1 ... Resting  01a2001e-...
+ACTION {"action":"cancel", ...}
+ORDER hft1795298319-1 ... CancelPending 01a2001e-...
+ORDER hft1795298319-1 ... Canceled 01a2001e-...
+DONE place_cancel: placed and canceled hft1795298319-1
+```
+`hft1795298319-1` is **our** order ID (session number + counter). The long
+one is **Kalshi's**. We pick our own so we can recognize the order in every
+message without waiting for Kalshi to tell us its ID.
+
+**Privacy note:** the log contains your Kalshi user ID (Kalshi includes it in
+order messages). Logs are never committed to git, so it stays on your
+computer.
+
+---
+
+## Step 6: Stop and look at what we have
+
+This is a basic trading system:
+
+```
+packets in  →  state machine  →  packets out
+```
+
+- Everything unpredictable (the network, the clock) is at the **edges**: the
+  network thread.
+- The middle (the state machine) is **predictable**. Same log in, same
+  output and same actions out, every time.
+- So whenever something goes wrong, we can replay the exact session and find
+  out why.
+
+**What's still rough** (the next steps fix these):
+
+| Problem | Why it matters | Fixed in |
+|---|---|---|
+| The network loop polls every 5 ms, and blocks during REST requests | wastes time, adds delay | step 7 |
+| No timer: the state machine only runs when a message arrives | can't act in a quiet market | step 7 |
+| If the connection drops, the program just sits there | can't run for long | step 7 |
+| We don't know how long messages wait before we read them | can't measure speed | step 8 |
+| Threads talk through a file on disk | slow, a hack | step 9 |
+
+---
+
 ## Where we are
 
 | Plan step | Status |
@@ -341,7 +445,9 @@ exactly what the live run used.
 | 2. State machine tracks the book | ✅ |
 | 3. Replay gives identical output | ✅ |
 | 4. The state machine can act | ✅ |
-| 5. Place one real order and cancel it | ⏳ next |
+| 5. Place one real order and cancel it | ✅ |
+| 6. Look at what we have | ✅ |
+| 7. A proper network loop | ⏳ next |
 
 ## Words to know
 

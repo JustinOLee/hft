@@ -76,7 +76,38 @@ pub struct Config {
     /// Testing aid: request one resync right after the first snapshot, to
     /// exercise the whole action path without placing an order.
     pub test_resync: bool,
+    pub strategy: Strategy,
 }
+
+/// Which trading logic to run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Strategy {
+    /// Just watch.
+    #[default]
+    None,
+    /// Plan step 5: place one tiny order far from the market, wait until
+    /// it's resting, cancel it, done.
+    PlaceCancel,
+}
+
+/// Progress of the place-then-cancel routine. This records what WE HAVE
+/// ASKED FOR, which runs ahead of what Kalshi has confirmed. Without it,
+/// every event that arrives between "decide to cancel" and "our cancel
+/// shows up in the log" would trigger another cancel.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum PlaceCancel {
+    #[default]
+    Idle,
+    Placed(String),    // client_order_id
+    Canceling(String), // client_order_id
+    Done,
+}
+
+/// The test order: buy 1 YES contract at $0.01. On any market trading well
+/// above 1 cent it will sit far below the best bid and never fill, and even
+/// if it did, it would cost one cent.
+const TEST_PRICE: Price = 100;
+const TEST_COUNT: i64 = 100; // 1.00 contract
 
 #[derive(Default)]
 pub struct StateMachine {
@@ -99,6 +130,14 @@ pub struct StateMachine {
     /// Last printed (bid, ask) per market, to print only on change.
     last_top: BTreeMap<String, (Option<Price>, Option<Price>)>,
     did_test_resync: bool,
+    place_cancel: PlaceCancel,
+    /// Replay-only testing aid: run this strategy regardless of what the
+    /// log's start event says. Lets you try a new strategy on an old log.
+    strategy_override: Option<Strategy>,
+    /// Session number (start time in seconds), used to make our
+    /// client_order_ids unique across runs.
+    session: u64,
+    next_order: u64,
     /// Actions produced during the current `update` call.
     out: Vec<Action>,
     /// Timestamp of the latest event seen. This is the state machine's "now".
@@ -110,11 +149,15 @@ impl StateMachine {
         StateMachine::default()
     }
 
+    pub fn with_strategy_override(strategy: Strategy) -> StateMachine {
+        StateMachine { strategy_override: Some(strategy), ..StateMachine::default() }
+    }
+
     /// Process one event. Returns the actions to take (usually none).
     pub fn update(&mut self, ev: &Event) -> Vec<Action> {
         self.now = ev.ts;
         match &ev.kind {
-            Kind::Start(data) => self.on_start(data),
+            Kind::Start(data) => self.on_start(ev.ts, data),
             Kind::TcpConnect => self.set_conn(ev.conn, ConnState::Connecting),
             Kind::TcpOpen => self.set_conn(ev.conn, ConnState::TcpOpen),
             Kind::TlsOpen => self.set_conn(ev.conn, ConnState::TlsOpen),
@@ -139,10 +182,25 @@ impl StateMachine {
             Kind::Action(action) => self.on_own_action(action),
             Kind::WsOut(_) | Kind::Other(_) => {}
         }
+        self.run_strategy();
         std::mem::take(&mut self.out)
     }
 
-    fn on_start(&mut self, data: &Value) {
+    /// True once the strategy has nothing left to do. Live and replay both
+    /// stop at this point, so they process exactly the same events.
+    pub fn finished(&self) -> bool {
+        self.config.strategy == Strategy::PlaceCancel && self.place_cancel == PlaceCancel::Done
+    }
+
+    fn on_start(&mut self, ts: u64, data: &Value) {
+        self.session = ts / 1_000_000_000;
+        self.config.strategy = match data["strategy"].as_str() {
+            Some("place_cancel") => Strategy::PlaceCancel,
+            _ => Strategy::None,
+        };
+        if let Some(s) = self.strategy_override {
+            self.config.strategy = s;
+        }
         self.config.tickers = data["tickers"]
             .as_array()
             .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
@@ -213,11 +271,19 @@ impl StateMachine {
                 if !ok {
                     self.warn(&format!("order {cid} rejected: HTTP {status} {body} {result:?}"));
                 }
-                self.set_status(&cid, if ok { OrderStatus::Accepted } else { OrderStatus::Rejected });
+                if !ok {
+                    self.set_status(&cid, OrderStatus::Rejected);
+                } else if self.orders.get(&cid).map(|o| o.status) == Some(OrderStatus::Pending) {
+                    // Only move forward: the private feed may already have
+                    // told us it's resting (it travels on another connection).
+                    self.set_status(&cid, OrderStatus::Accepted);
+                }
             }
             InFlight::Cancel(cid) => {
                 if ok {
-                    self.set_status(&cid, OrderStatus::Canceled);
+                    if self.orders.get(&cid).map(|o| o.status) == Some(OrderStatus::CancelPending) {
+                        self.set_status(&cid, OrderStatus::Canceled);
+                    }
                 } else {
                     // The order may still be live. Don't guess: the
                     // user_orders feed will tell us its real status.
@@ -404,6 +470,77 @@ impl StateMachine {
     fn warn(&self, what: &str) {
         eprintln!("{} WARN {what}", self.now);
     }
+
+    // ---- strategy --------------------------------------------------------
+
+    fn run_strategy(&mut self) {
+        if self.config.strategy == Strategy::PlaceCancel {
+            self.run_place_cancel();
+        }
+    }
+
+    fn new_client_order_id(&mut self) -> String {
+        self.next_order += 1;
+        format!("hft{}-{}", self.session, self.next_order)
+    }
+
+    fn run_place_cancel(&mut self) {
+        let Some(ticker) = self.config.tickers.first().cloned() else { return };
+        match self.place_cancel.clone() {
+            PlaceCancel::Idle => {
+                // Wait until we can see the market and Kalshi can see us.
+                let ws_open = self.conns.get(&WS_CONN) == Some(&ConnState::Open);
+                let Some(book) = self.books.get(&ticker) else { return };
+                if !ws_open {
+                    return;
+                }
+                // Safety check: only proceed if our 1-cent bid would really
+                // be far below the market.
+                if book.best_bid().is_none_or(|(bid, _)| bid < TEST_PRICE * 5) {
+                    self.warn("place_cancel: market's best bid is too low for a safe test; giving up");
+                    self.place_cancel = PlaceCancel::Done;
+                    return;
+                }
+                let cid = self.new_client_order_id();
+                self.out.push(Action::Place {
+                    client_order_id: cid.clone(),
+                    ticker,
+                    side: crate::action::OrderSide::Bid,
+                    price: TEST_PRICE,
+                    count: TEST_COUNT,
+                    post_only: true,
+                });
+                self.place_cancel = PlaceCancel::Placed(cid);
+            }
+            PlaceCancel::Placed(cid) => {
+                let Some(order) = self.orders.get(&cid) else { return }; // not back from the log yet
+                match order.status {
+                    OrderStatus::Resting => {
+                        let Some(order_id) = order.order_id.clone() else { return };
+                        self.out.push(Action::Cancel { ticker, order_id });
+                        self.place_cancel = PlaceCancel::Canceling(cid);
+                    }
+                    OrderStatus::Rejected | OrderStatus::Canceled | OrderStatus::Executed => {
+                        println!("{} DONE place_cancel: order ended as {:?} before we canceled", self.now, order.status);
+                        self.place_cancel = PlaceCancel::Done;
+                    }
+                    _ => {} // Pending / Accepted: keep waiting
+                }
+            }
+            PlaceCancel::Canceling(cid) => match self.orders.get(&cid).map(|o| o.status) {
+                Some(OrderStatus::Canceled) => {
+                    println!("{} DONE place_cancel: placed and canceled {cid}", self.now);
+                    self.place_cancel = PlaceCancel::Done;
+                }
+                Some(OrderStatus::Executed) => {
+                    println!("{} DONE place_cancel: {cid} FILLED before the cancel landed", self.now);
+                    self.place_cancel = PlaceCancel::Done;
+                }
+                _ => {}
+            },
+            PlaceCancel::Done => {}
+        }
+    }
 }
 
 /// Parse `[["0.0800", "300.00"], ...]` into (price, quantity) pairs.
@@ -518,6 +655,56 @@ mod tests {
         sm.update(&ev(6, REST_CONN, Kind::HttpResponse("HTTP/1.1 200 OK\r\n\r\n".into())));
         sm.update(&ev(7, REST_CONN, Kind::HttpResponseBody(r#"{"order_id":"o9"}"#.into())));
         assert_eq!(sm.orders["c1"].status, OrderStatus::Canceled);
+    }
+
+    #[test]
+    fn place_cancel_strategy() {
+        let mut sm = StateMachine::new();
+        let start = serde_json::json!({ "tickers": ["T"], "strategy": "place_cancel" });
+        sm.update(&ev(1_000_000_000, 0, Kind::Start(start)));
+        sm.update(&ev(1, WS_CONN, Kind::HttpRequest(String::new())));
+        sm.update(&ev(2, WS_CONN, Kind::HttpResponse("HTTP/1.1 101 Switching Protocols\r\n\r\n".into())));
+
+        // Book arrives: place exactly once, even as more events come in.
+        let actions = sm.update(&ws_in(3, SNAP));
+        assert_eq!(actions.len(), 1);
+        let Action::Place { client_order_id: cid, price, post_only, .. } = &actions[0] else { panic!() };
+        assert_eq!((cid.as_str(), *price, *post_only), ("hft1-1", TEST_PRICE, true));
+        assert!(sm.update(&ws_in(4, &SNAP.replace(r#""seq":1"#, r#""seq":2"#))).is_empty());
+
+        // Our action comes back, Kalshi accepts and confirms it's resting.
+        sm.update(&ev(5, 0, Kind::Action(actions[0].clone())));
+        sm.update(&ev(6, REST_CONN, Kind::HttpResponse("HTTP/1.1 201 Created\r\n\r\n".into())));
+        assert!(sm.update(&ev(7, REST_CONN, Kind::HttpResponseBody(r#"{"order_id":"o9"}"#.into()))).is_empty());
+        let actions = sm.update(&ws_in(8, r#"{"type":"user_order","sid":5,"msg":{"order_id":"o9","client_order_id":"hft1-1","status":"resting"}}"#));
+        assert_eq!(actions, vec![Action::Cancel { ticker: "T".into(), order_id: "o9".into() }]);
+
+        // More events before the cancel shows up in the log: no repeat.
+        assert!(sm.update(&ws_in(9, &SNAP.replace(r#""seq":1"#, r#""seq":3"#))).is_empty());
+
+        sm.update(&ev(10, 0, Kind::Action(actions[0].clone())));
+        sm.update(&ev(11, REST_CONN, Kind::HttpResponse("HTTP/1.1 200 OK\r\n\r\n".into())));
+        sm.update(&ev(12, REST_CONN, Kind::HttpResponseBody(r#"{"order_id":"o9"}"#.into())));
+        assert!(sm.finished());
+    }
+
+    #[test]
+    fn status_never_moves_backwards() {
+        let mut sm = started(&["T"]);
+        let place = Action::Place {
+            client_order_id: "c1".into(),
+            ticker: "T".into(),
+            side: OrderSide::Bid,
+            price: 100,
+            count: 100,
+            post_only: true,
+        };
+        sm.update(&ev(1, 0, Kind::Action(place)));
+        // The private feed beats the REST response.
+        sm.update(&ws_in(2, r#"{"type":"user_order","sid":5,"msg":{"order_id":"o9","client_order_id":"c1","status":"resting"}}"#));
+        sm.update(&ev(3, REST_CONN, Kind::HttpResponse("HTTP/1.1 201 Created\r\n\r\n".into())));
+        sm.update(&ev(4, REST_CONN, Kind::HttpResponseBody(r#"{"order_id":"o9"}"#.into())));
+        assert_eq!(sm.orders["c1"].status, OrderStatus::Resting);
     }
 
     #[test]
