@@ -7,6 +7,7 @@ edition = "2021"
 base64 = "0.23.1"
 ed25519-dalek = { version = "3.0.0", features = ["pkcs8", "pem"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 webpki-roots = { version = "1.0.12", default-features = false }

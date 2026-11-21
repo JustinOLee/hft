@@ -6,6 +6,7 @@
 
 use serde_json::Value;
 
+use crate::action::Action;
 use crate::Error;
 
 /// One line of the log.
@@ -24,12 +25,19 @@ pub struct Event {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // some payloads aren't read yet; later steps use them
 pub enum Kind {
-    Start,
+    /// First event of a session. Carries the session's settings, because
+    /// settings are inputs too: replay must see the same ones.
+    Start(Value),
     TcpConnect,
     TcpOpen,
     TlsOpen,
     HttpRequest(String),
     HttpResponse(String),
+    HttpResponseBody(String),
+    /// A REST request failed before we got a response.
+    HttpError(String),
+    /// An action the network thread is about to carry out.
+    Action(Action),
     WsOut(String),
     WsIn(String),
     WsClose,
@@ -50,12 +58,15 @@ impl Event {
         let text = || v["data"].as_str().unwrap_or("").to_string();
 
         let kind = match kind_name {
-            "start" => Kind::Start,
+            "start" => Kind::Start(v["data"].clone()),
             "tcp_connect" => Kind::TcpConnect,
             "tcp_open" => Kind::TcpOpen,
             "tls_open" => Kind::TlsOpen,
             "http_request" => Kind::HttpRequest(text()),
             "http_response" => Kind::HttpResponse(text()),
+            "http_response_body" => Kind::HttpResponseBody(text()),
+            "http_error" => Kind::HttpError(text()),
+            "action" => Kind::Action(serde_json::from_value(v["data"].clone())?),
             "ws_out" => Kind::WsOut(text()),
             "ws_in" => Kind::WsIn(text()),
             "ws_close" => Kind::WsClose,

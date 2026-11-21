@@ -15,10 +15,15 @@ use base64::Engine;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signer, SigningKey};
 
-use crate::ws::Header;
+use serde_json::json;
+
+use crate::action::{Action, OrderSide};
+use crate::fixed;
+use crate::net::Header;
 use crate::Error;
 
 pub const WS_PATH: &str = "/trade-api/ws/v2";
+pub const REST_PREFIX: &str = "/trade-api/v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Env {
@@ -35,6 +40,68 @@ impl Env {
             Env::Prod => "external-api-ws.kalshi.com",
         }
     }
+
+    pub fn rest_host(self) -> &'static str {
+        match self {
+            Env::Demo => "external-api.demo.kalshi.co",
+            Env::Prod => "external-api.kalshi.com",
+        }
+    }
+}
+
+/// One REST request, described but not yet sent.
+#[derive(Debug, PartialEq)]
+pub struct RestCall {
+    pub method: &'static str,
+    /// Path WITHOUT the query string: this is what gets signed.
+    pub path: String,
+    /// "" or "?key=value..."
+    pub query: String,
+    pub body: Option<String>,
+}
+
+impl RestCall {
+    fn new(method: &'static str, path: String) -> RestCall {
+        RestCall { method, path, query: String::new(), body: None }
+    }
+}
+
+/// Translate an action into the REST request that carries it out, or None
+/// if the action doesn't go over REST. A pure function: easy to test.
+pub fn rest_call(action: &Action) -> Option<RestCall> {
+    match action {
+        Action::Place { client_order_id, ticker, side, price, count, post_only } => {
+            let body = json!({
+                "ticker": ticker,
+                "side": match side { OrderSide::Bid => "bid", OrderSide::Ask => "ask" },
+                "count": fixed::format(*count, fixed::QTY_DECIMALS),
+                "price": fixed::format_price(*price),
+                // Rest until filled or canceled.
+                "time_in_force": "good_till_canceled",
+                // If we'd trade against our own resting order, cancel the
+                // resting one rather than trade with ourselves.
+                "self_trade_prevention_type": "maker",
+                "client_order_id": client_order_id,
+                "post_only": post_only,
+            });
+            let mut call = RestCall::new("POST", format!("{REST_PREFIX}/portfolio/events/orders"));
+            call.body = Some(body.to_string());
+            Some(call)
+        }
+        Action::Cancel { ticker, order_id } => {
+            let mut call = RestCall::new("DELETE", format!("{REST_PREFIX}/portfolio/events/orders/{order_id}"));
+            // Kalshi needs the ticker to find which part of its system holds
+            // the order.
+            call.query = format!("?market_ticker={ticker}");
+            Some(call)
+        }
+        Action::Resync { .. } => None,
+    }
+}
+
+/// Our account balance: a harmless signed request for testing.
+pub fn balance_call() -> RestCall {
+    RestCall::new("GET", format!("{REST_PREFIX}/portfolio/balance"))
 }
 
 /// API credentials. Deliberately NOT `Debug`, so `{:?}` can never print the
@@ -91,6 +158,33 @@ impl Credentials {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signature, Verifier};
+
+    #[test]
+    fn place_and_cancel_requests() {
+        let place = Action::Place {
+            client_order_id: "hft1-1".into(),
+            ticker: "KXT-1".into(),
+            side: OrderSide::Bid,
+            price: 100,  // $0.0100
+            count: 100,  // 1.00 contract
+            post_only: true,
+        };
+        let call = rest_call(&place).unwrap();
+        assert_eq!(call.method, "POST");
+        assert_eq!(call.path, "/trade-api/v2/portfolio/events/orders");
+        let body: serde_json::Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["price"], "0.0100");
+        assert_eq!(body["count"], "1.00");
+        assert_eq!(body["side"], "bid");
+        assert_eq!(body["post_only"], true);
+
+        let cancel = Action::Cancel { ticker: "KXT-1".into(), order_id: "abc".into() };
+        let call = rest_call(&cancel).unwrap();
+        assert_eq!(call.method, "DELETE");
+        assert_eq!(call.path, "/trade-api/v2/portfolio/events/orders/abc");
+        assert_eq!(call.query, "?market_ticker=KXT-1");
+        assert_eq!(call.body, None);
+    }
 
     #[test]
     fn signs_timestamp_method_path() {
