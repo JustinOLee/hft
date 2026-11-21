@@ -543,6 +543,50 @@ put it back (`read_into_inbuf`).
 
 ---
 
+## Step 8: Where does the time go?
+
+**Files:** `scripts/latency.py` (new), `src/main.rs` (`replay --check-actions`)
+
+**The plan's idea:** ask the operating system to stamp every network packet
+with the exact moment it arrived (a **kernel timestamp**). Comparing that with
+the moment our loop read it shows how long data waits for us.
+
+**What we found: macOS can't do this for TCP.** We tested before building
+anything. A small script turned on the `SO_TIMESTAMP` option, read from a web
+server, and got no timestamps back. The macOS header file says why: the
+option is for "dgram traffic", meaning UDP only, while our connections are
+TCP. Linux supports it for TCP, so this is for later, on a Linux machine.
+**Lesson: test the risky assumption first, with the smallest possible
+experiment.**
+
+**What we measure instead**, all from the log:
+
+| What | How | Result |
+|---|---|---|
+| Kalshi → us | Kalshi stamps some messages with `sending_ts_ms`. Our receive time minus that. | about **−42 ms**, varying by only **2 ms** |
+| REST round trip | request written → response complete | **42–48 ms** |
+| Our own delay | trigger event arrives → action reaches the network thread | **1.4–3.4 ms** |
+
+**How to read these:**
+- **Kalshi → us is negative.** That's impossible as a travel time, so it
+  means **our clock is behind Kalshi's**. Two computers' clocks never agree
+  exactly, and the difference here is bigger than the travel time. The
+  useful part is the *spread*: it barely changes (2 ms), so the network path
+  is very steady.
+- **About 45 ms each way** to Kalshi's servers. That's most of our total
+  delay, and it comes from physical distance. Professional traders rent
+  computers in the same building as the exchange to shrink it.
+- **Our own 1 to 3 ms** is mostly the file-reading loop, which sleeps 1 ms
+  whenever it reaches the end of the file. That's what step 9 is about.
+
+**Commands:**
+```
+python3 scripts/latency.py logs/<file>.log
+cargo run -- replay --check-actions logs/<file>.log
+```
+
+---
+
 ## Where we are
 
 | Plan step | Status |
@@ -554,7 +598,8 @@ put it back (`read_into_inbuf`).
 | 5. Place one real order and cancel it | ✅ |
 | 6. Look at what we have | ✅ |
 | 7. A proper network loop | ✅ |
-| 8. Measure waiting time (kernel timestamps) | ⏳ next |
+| 8. Measure waiting time | ✅ (Mac version; see below) |
+| 9. A real queue between the threads | ⏳ next |
 
 ## Words to know
 

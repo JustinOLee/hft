@@ -88,10 +88,12 @@ fn main() -> Result<(), Error> {
 
 /// What a run of the state machine produced.
 struct RunResult {
-    /// Actions the state machine returned, in order.
-    emitted: Vec<Action>,
-    /// Actions found in the log (written by the network thread), in order.
-    logged: Vec<Action>,
+    /// Actions the state machine returned, in order, with the timestamp of
+    /// the event that triggered each one.
+    emitted: Vec<(u64, Action)>,
+    /// Actions found in the log (written by the network thread), in order,
+    /// with the time the network thread received each one.
+    logged: Vec<(u64, Action)>,
 }
 
 /// Feed every line from the tailer into a fresh state machine, printing the
@@ -111,11 +113,11 @@ fn run_state_machine(
     while let Some(line) = tailer.next_line()? {
         let ev = Event::parse(&line)?;
         if let event::Kind::Action(a) = &ev.kind {
-            result.logged.push(a.clone());
+            result.logged.push((ev.ts, a.clone()));
         }
         for action in sm.update(&ev) {
             println!("{} ACTION {}", sm.now, serde_json::to_string(&action)?);
-            result.emitted.push(action.clone());
+            result.emitted.push((sm.now, action.clone()));
             if let Some(sink) = &actions_tx {
                 if let Err(e) = sink.send(action) {
                     eprintln!("{} WARN action dropped: {e}", sm.now);
@@ -142,10 +144,17 @@ fn replay(log_path: &str, check_actions: bool, strategy: Option<Strategy>) -> Re
     // A live run may stop before the network thread logs the last actions
     // it was sent, so the logged list can be a prefix of the emitted one.
     let n = r.logged.len();
-    if r.emitted.len() >= n && r.emitted[..n] == r.logged[..] {
+    let same = r.emitted.len() >= n && r.emitted.iter().zip(&r.logged).all(|((_, a), (_, b))| a == b);
+    if same {
         eprintln!("PASS: replay produced the same {n} action(s) the live run logged");
         if r.emitted.len() > n {
             eprintln!("      (plus {} the live run hadn't logged yet when it stopped)", r.emitted.len() - n);
+        }
+        // How long each action took from "the event that caused it arrived"
+        // to "the network thread has it": our own internal delay.
+        for ((decided, a), (logged, _)) in r.emitted.iter().zip(&r.logged) {
+            let kind = serde_json::to_value(a)?["action"].as_str().unwrap_or("?").to_string();
+            eprintln!("      {kind:<7} reached the network thread {} us after its trigger event", (logged - decided) / 1000);
         }
         Ok(())
     } else {
