@@ -18,7 +18,11 @@ markets. The ideas behind each experiment are in
    information *before* the market has it, which is a speed race.
 4. **Simple biases didn't survive testing.** One looked profitable on the
    training days and lost money on the test days.
-5. No strategy so far makes money after fees. That's the expected result,
+5. **Kalshi too.** On Kalshi's 15-minute BTC markets (the US-legal
+   venue), 27 days of data showed a promising +1¢ to +3¢ per contract.
+   With 68 days it **vanished** (+0.4¢ ± 0.7¢). The most important lesson
+   of the day: small samples lie.
+6. No strategy so far makes money after fees. That's the expected result,
    and it's the honest baseline to build on.
 
 ---
@@ -158,11 +162,71 @@ has `spot_source: mean`.
 
 ---
 
+## Kalshi's 15-minute BTC markets (KXBTC15M)
+
+**Data:** 6,490 settled markets over 68 days (all the API returned),
+fetched by `research/fetch_kalshi.py`, analyzed by
+`research/analyze_kalshi.py`. Kalshi's history is cleaner than
+Polymarket's:
+- the reference price (`floor_strike`) is published, so it's exact;
+- candles give the real YES **bid and ask** at each minute's end, which is
+  exactly when a Coinbase candle opens, so there's **no stale-price
+  handicap**;
+- average volume is ~3.2 million contracts per market, and the spread is
+  1¢ almost always.
+
+| | 27 days (first look) | **68 days** |
+|---|---|---|
+| K1. Coinbase rule matches Kalshi's result | 97.6% | 97.0% |
+| K1. Kalshi's index (BRTI) minus Coinbase, median | +$3.61 | +$2.57 |
+| K3. Brier: model / Kalshi mid, same moment | 0.1596 / 0.1587 | 0.1598 / **0.1564** |
+| K4. Blend weight of the model (vs Kalshi's ~1.0) | **0.41** | **0.002** |
+| K4. Test log loss: Kalshi alone / + model | 0.4616 / 0.4599 | 0.4698 / 0.4697 |
+| K5. Paper taker profit per contract (real ask + fee) | +1.3¢ … +3.0¢ (≈1σ each) | **+0.4¢ ± 0.7¢** |
+| K6. "Buy NO when YES is 55–80¢", train / test | +0.7¢ / +1.6¢ | **−1.8¢** / +0.9¢ |
+
+**What happened.** On 27 days, the model seemed to add real information
+to Kalshi's price, and every trading threshold made money. Each result
+was only about one standard error from zero, which means "could easily be
+luck", and the bigger sample showed it was. This is the trap from
+STRATEGIES.md's sample-size table, caught in the act: a plausible story
+(Kalshi is less efficient than Polymarket), a backtest that agreed, and
+then nothing.
+
+**What survived.**
+- With fair timing, our simple model is close to Kalshi's price, but Kalshi
+  is still better, especially in the last minutes.
+- Kalshi slightly overprices YES around 50–75¢ (K2: priced 0.549 → won
+  0.531), but after the spread and the 0.07·p(1−p) fee, it's not
+  tradeable as a taker.
+- Kalshi's index runs a couple of dollars above Coinbase. Because the
+  market compares two averages from the same index, a steady difference
+  cancels out; only changes in it matter.
+
+---
+
 ## Experiments on live recordings
 
 Recordings have every book change and Coinbase tick, so timing questions
 become answerable. Exported with `hft lab export`, analyzed by
 `research/analyze_recording.py`.
 
-*First session (25 minutes, 5 windows): too small to conclude anything,
-used to check the tools. The 8-hour session's results go here.*
+**Session s2 (planned 8 h), and a lesson.** Half an hour in, both BTC
+feeds went silent without disconnecting (see PRIMER, "silence isn't
+success"). Only the first 0.5 h (7 windows) is usable. Its hints, far too
+small to trust:
+
+- **X2, who moves first:** price changes line up mostly within the same
+  second (correlation 0.63), with a smaller echo 1–2 s later (0.17, 0.12):
+  Polymarket follows Coinbase partly with a short delay.
+- **X3, book imbalance:** a heavy bid side predicts the next 1 s move of
+  the Up price (correlation 0.29), fading by 15 s (0.06), the same shape
+  the order-flow papers describe.
+- **X4, disagreement:** when our model and the market disagree, the market
+  moves about 60% of the way toward the model within 5 s.
+- **X5, last seconds:** too few windows to say anything.
+
+X2 and X4 together say the market lags Coinbase by about a second. That's
+exactly the speed game from STRATEGIES.md, and the history says that,
+after fees, it isn't enough to profit from. The 6-hour session s3 (with the
+watchdog) will check these with ~70 windows.

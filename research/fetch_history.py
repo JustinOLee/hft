@@ -135,6 +135,7 @@ def main():
     ap.add_argument("--days", type=float, default=7)
     ap.add_argument("--out", default="research/data")
     ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--candles-only", action="store_true", help="skip Polymarket windows")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
@@ -148,7 +149,7 @@ def main():
     if os.path.exists(wpath):
         with open(wpath) as f:
             done = {json.loads(l)["start"] for l in f}
-    todo = [s for s in starts if s not in done]
+    todo = [] if a.candles_only else [s for s in starts if s not in done]
     print(f"{len(starts)} windows, {len(todo)} to fetch", file=sys.stderr)
     with open(wpath, "a") as out, ThreadPoolExecutor(a.workers) as pool:
         for n, w in enumerate(pool.map(fetch_window, todo), 1):
