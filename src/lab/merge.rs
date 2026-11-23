@@ -18,12 +18,12 @@ pub struct MergedReader {
 }
 
 impl MergedReader {
-    /// Open every `*.log` file in `dir`.
+    /// Open every `*.log` and `*.log.gz` file in `dir`.
     pub fn open_dir(dir: &str) -> Result<MergedReader, Error> {
         let mut paths: Vec<String> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.path().to_string_lossy().into_owned())
-            .filter(|p| p.ends_with(".log"))
+            .filter(|p| p.ends_with(".log") || p.ends_with(".log.gz"))
             .collect();
         paths.sort();
         if paths.is_empty() {

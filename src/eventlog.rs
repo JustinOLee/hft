@@ -15,33 +15,64 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde_json::{json, Value};
 
 pub struct EventLog {
-    file: File,
+    sink: Sink,
 }
+
+enum Sink {
+    /// Plain text: every line is visible to readers immediately (live mode).
+    Plain(File),
+    /// gzip-compressed, about 10x smaller. Lines sit in the compressor's
+    /// memory until the next flush, so nobody can follow this file live.
+    /// Used by the lab's recorder, where disk space matters more.
+    Gz { enc: GzEncoder<File>, last_flush: u64 },
+}
+
+/// Push compressed data to disk at least this often, so a crash or Ctrl-C
+/// loses at most about this much of a recording.
+const GZ_FLUSH_NS: u64 = 1_000_000_000;
 
 impl EventLog {
     /// Create a NEW log file. Fails if the file already exists: one file per
     /// session, so we never mix two sessions together by accident.
     pub fn create(path: &str) -> io::Result<EventLog> {
         let file = OpenOptions::new().create_new(true).append(true).open(path)?;
-        Ok(EventLog { file })
+        let sink = if path.ends_with(".gz") {
+            Sink::Gz { enc: GzEncoder::new(file, Compression::fast()), last_flush: now_nanos() }
+        } else {
+            Sink::Plain(file)
+        };
+        Ok(EventLog { sink })
     }
 
-    /// Write one event. `File` is unbuffered, so each call is a single
-    /// `write` syscall: the line is in the OS's hands by the time this returns,
-    /// and another thread tailing the file can see it immediately.
+    /// Write one event. For plain files, `File` is unbuffered, so each call
+    /// is a single `write` syscall: the line is in the OS's hands by the time
+    /// this returns, and another thread tailing the file can see it at once.
     pub fn write(&mut self, conn: u64, kind: &str, data: Value) -> io::Result<()> {
+        let ts = now_nanos();
         let event = json!({
-            "ts": now_nanos(),
+            "ts": ts,
             "conn": conn,
             "kind": kind,
             "data": data,
         });
         let mut line = event.to_string();
         line.push('\n');
-        self.file.write_all(line.as_bytes())
+        match &mut self.sink {
+            Sink::Plain(f) => f.write_all(line.as_bytes()),
+            Sink::Gz { enc, last_flush } => {
+                enc.write_all(line.as_bytes())?;
+                if ts - *last_flush >= GZ_FLUSH_NS {
+                    enc.flush()?; // a "sync flush": everything so far becomes readable
+                    *last_flush = ts;
+                }
+                Ok(())
+            }
+        }
     }
 }
 

@@ -708,6 +708,35 @@ two markets. The traders quoting them adjust constantly. That's about
 **1.5 GB per hour** of raw log. Fine for sessions of an hour or two;
 long recordings will need compression.
 
+### Research round 1: what 30 days of history taught us
+
+Full write-up: [RESEARCH.md](RESEARCH.md). The lessons, in short:
+
+1. **Read the fine print, with data.** The rules say the market settles on
+   a "TWAP" (time-weighted average price), without saying exactly which
+   one. We tested six possible rules against 8,600 official results. The
+   winner, matching 95% of the time, compares two one-minute averages: the
+   last minute of the window vs the minute *before* it began. Fixing the
+   model to use that rule helped more than anything else we tried.
+2. **The market is hard to beat.** Its prices match reality closely, and
+   our model adds nothing the price doesn't already know.
+3. **Timing is most of the gap.** Our history only has a BTC price once a
+   minute. When that price happened to be fresh, the model was almost as
+   good as the market.
+4. **Overfitting is real.** A small price bias looked profitable on 20 days
+   and lost money on the next 10. Always test on data you didn't tune on.
+
+### Tools added along the way
+
+- **Compressed recordings** (`.log.gz`): ~11× smaller, read back directly.
+  Same backtest output, byte for byte.
+- **One-pass sweeps:** the backtest reads a session once and feeds every
+  config, so trying 20 settings costs little more than one.
+- **`hft lab export`:** one CSV row per evaluation, for analysis in Python.
+- **`research/`:** Python scripts (standard library only) to download
+  history and run the experiments. Rust stays for the trading code; Python
+  is quicker for one-off questions about data.
+
 ---
 
 ## Where we are

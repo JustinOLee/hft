@@ -42,12 +42,24 @@ For the strategy ideas themselves, see [STRATEGIES.md](STRATEGIES.md).
    lab/configs/*.json`. Every config runs on exactly the same data, and the
    same config always gives the same answer, because the simulator follows
    the same rules as the trading state machine (no clock, no randomness).
+   The session is read once and fed to every config, so sweeping many
+   configs costs little more than one. To split train/test, set
+   `LAB_FIRST_WINDOW` / `LAB_LAST_WINDOW` (window start times).
+3. **Export** for analysis: `hft lab export DIR CONFIG > out.csv` writes
+   one row per evaluation (model, spot, both books' tops).
+4. **History**: `research/fetch_history.py` downloads 30+ days of
+   minute-level prices and results; `research/analyze.py` runs model
+   experiments on them. Results: [RESEARCH.md](RESEARCH.md).
+
+Recordings are gzip-compressed (`*.log.gz`, ~350 MB/hour).
 
 ### What a backtest does, second by second
 
 - **Spot price:** the Coinbase BTC-USD mid price.
-- **Start price ("open"):** the spot price at the first tick of the window.
-  A window we joined late has no trustworthy open, so it's skipped.
+- **Reference price:** the average spot price over the minute *before*
+  the window began. (The market settles on last-minute average vs this;
+  found from data, RESEARCH.md E2.) A window we joined late has no
+  reference, so it's skipped.
 - **Volatility:** how jumpy BTC is now (`vol.rs`).
 - **Fair value:** the model's chance that Up wins (`model.rs`).
 - **Order books:** the Polymarket Up and Down books (`pmbook.rs`).
@@ -97,10 +109,12 @@ All in a JSON file (see `lab/configs/`). Anything left out keeps its default.
 | `shares` | 10 | shares per order | |
 | `max_shares` | 100 | most shares of one side per window | |
 | `no_trade_last_s` | 10 | stop trading this close to the end | 0, 30, 60 |
-| `vol_halflife_s` | 120 | how fast the volatility estimate reacts | 15, 60, 600 |
+| `model` | `avg60` | settlement rule: `avg60` (real) or `point` (end vs start price) | compare both |
+| `vol_halflife_s` | 1800 | how fast the volatility estimate reacts | 60, 300, 7200 |
 | `vol_prior` | 1e-4 | starting volatility guess per √second (~50%/year) | |
 | `latency_ms` | 100 | pretend order travel time | 0, 500, 2000 |
 | `eval_ms` | 1000 | how often the strategy is asked | 100, 5000 |
+| `first_window` / `last_window` | 0 | only trade/score windows in this range (unix s; 0 = all) | train/test split |
 | `verbose` | false | print every decision and fill (or pass `-v`) | |
 
 Good first experiments:
@@ -127,35 +141,32 @@ Each stage is small, and each ends with something you can run.
 - [x] three strategies: `none`, `always_up` (baseline), `fair_value_taker`
 - [x] config files for the levers, and a results table with Brier scores
 
-### Stage 1: look at the data
+### Stage 1: look at the data ✅
 
-You can't improve what you can't see.
+- [x] `hft lab export DIR CONFIG` → CSV, one row per evaluation
+- [x] calibration tables (RESEARCH.md E3, E11)
+- [x] gzip recordings, read directly (~350 MB/hour instead of ~3 GB)
+- [x] 30 days of minute-level history for model research
+- [ ] charts: plot a window (spot, reference, model, market) as a page
 
-- [ ] `hft lab export DIR` → one CSV row per second: spot − open, seconds left,
-      model P(up), market bid/ask, our holdings. Plot it (spreadsheet, or a
-      small chart page).
-- [ ] A **calibration table**: group forecasts into buckets (0–10%,
-      10–20%, …) and check how often Up actually won in each. A good model's
-      "70%" bucket wins about 70% of the time.
-- [ ] Record a long session (a few hours to a day). Note that Polymarket's
-      feed is chatty (~1.5 GB/hour raw); compress old sessions with `gzip`
-      (TODO: read `.gz` directly).
+### Stage 2: honest testing (partly done)
 
-### Stage 2: honest testing
-
+- [x] train/test split by date in the history research; window ranges
+      (`first_window`/`last_window`) for recordings
+- [x] one-pass sweeps: many configs over one read of a session
 - [ ] **Train/test split:** choose settings on one session, report results
       on another. The `sweep` should try a grid of levers and show the best
       *on the training data* next to how it did *on the test data*.
 - [ ] Confidence intervals on pnl (how big is the luck?).
 
-### Stage 3: a better model
+### Stage 3: a better model (partly done)
 
-- [ ] Settlement on an **average** price over the last minute, not one
-      instant (an average moves less, so be more confident earlier).
-- [ ] **The real settlement price.** Polymarket uses Chainlink's BTC/USD
-      stream. Polymarket's real-time data socket may also carry Chainlink
-      prices (check its docs); if so, record it and measure the basis
-      against Coinbase.
+- [x] Settlement on one-minute **averages** (found from data: RESEARCH.md
+      E2), now the default model (`avg60`)
+- [ ] **The real settlement price.** Polymarket's live data socket carries
+      Chainlink prices, but needs a Polymarket account plus a Chainlink API
+      key (not available to US residents). Alternatives: approximate
+      Chainlink with a multi-exchange average.
 - [ ] Fat tails (a t-distribution instead of the normal), and
       time-of-day volatility.
 

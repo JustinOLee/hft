@@ -11,7 +11,7 @@
 //!   2. apply the event: spot price, order book, new market, or resolution
 //!   3. once per `eval_ms`, ask the strategy what it wants
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::Value;
 
@@ -31,6 +31,12 @@ const NS: u64 = 1_000_000_000;
 /// seconds of the start. (If recording began mid-window, we didn't.)
 const OPEN_TOLERANCE_S: u64 = 2;
 
+/// The market settles on one-minute averages (see model.rs).
+const AVG_S: u64 = 60;
+
+/// Only trust a one-minute average if we have prices for most of its seconds.
+const MIN_AVG_SAMPLES: usize = 45;
+
 #[derive(Default)]
 struct Window {
     start: u64,
@@ -39,9 +45,13 @@ struct Window {
     down_token: String,
     up: PmBook,
     down: PmBook,
-    /// Coinbase mid at the first tick at/after start and end.
+    /// Coinbase mid at the first tick at/after start and end ("point" rule).
     open_spot: Option<f64>,
     close_spot: Option<f64>,
+    /// Coinbase average over the minute before start, and over the last
+    /// minute ("avg60" rule, what the market really uses).
+    ref_avg: Option<f64>,
+    end_avg: Option<f64>,
     /// The official result, from Polymarket.
     up_won: Option<bool>,
     /// (model P(up), market mid of Up), sampled at each evaluation, to score
@@ -52,13 +62,30 @@ struct Window {
 
 impl Window {
     /// The best guess of how it ended: official if known, else our proxy
-    /// (Coinbase close >= open). The proxy uses a different price source,
-    /// so it's occasionally wrong when the move is tiny.
-    fn result(&self) -> Option<(bool, bool)> {
+    /// computed from Coinbase. The proxy uses a different price source than
+    /// the market (Chainlink), so it's occasionally wrong when the move is tiny.
+    fn result(&self, avg: bool) -> Option<(bool, bool)> {
         if let Some(w) = self.up_won {
             return Some((w, true));
         }
-        Some((self.close_spot? >= self.open_spot?, false))
+        Some((self.proxy(avg)?, false))
+    }
+
+    fn proxy(&self, avg: bool) -> Option<bool> {
+        if avg {
+            Some(self.end_avg? >= self.ref_avg?)
+        } else {
+            Some(self.close_spot? >= self.open_spot?)
+        }
+    }
+
+    /// The price the window is measured against, under the chosen rule.
+    fn reference(&self, avg: bool) -> Option<f64> {
+        if avg {
+            self.ref_avg
+        } else {
+            self.open_spot
+        }
     }
 
     fn book(&self, o: Outcome) -> &PmBook {
@@ -80,6 +107,10 @@ pub struct Sim {
     strat: Box<dyn Strategy>,
     now: u64,
     spot: Option<f64>,
+    /// The latest mid in each of the last few hundred seconds: (second, mid).
+    seconds: VecDeque<(u64, f64)>,
+    /// True for the "avg60" settlement rule, false for "point".
+    avg_rule: bool,
     vol: Vol,
     windows: BTreeMap<u64, Window>,
     /// token id -> (window start, which outcome)
@@ -87,10 +118,21 @@ pub struct Sim {
     paper: Paper,
     pending: Vec<Pending>,
     next_eval: u64,
+    /// If set, every evaluation is also written here as a CSV row.
+    export: Option<Box<dyn std::io::Write>>,
 }
+
+/// Column names for `hft lab export`.
+pub const EXPORT_HEADER: &str =
+    "ts_ns,window,secs_left,spot,reference,sigma,p_up,up_bid,up_ask,up_bid_size,up_ask_size,down_bid,down_ask";
 
 impl Sim {
     pub fn new(cfg: Config) -> Result<Sim, Error> {
+        let avg_rule = match cfg.model.as_str() {
+            "avg60" => true,
+            "point" => false,
+            other => return Err(format!("unknown model {other:?} (use \"avg60\" or \"point\")").into()),
+        };
         Ok(Sim {
             strat: strategy::build(&cfg)?,
             vol: Vol::new(cfg.vol_prior, cfg.vol_halflife_s),
@@ -98,21 +140,39 @@ impl Sim {
             cfg,
             now: 0,
             spot: None,
+            seconds: VecDeque::new(),
+            avg_rule,
             windows: BTreeMap::new(),
             tokens: BTreeMap::new(),
             pending: Vec::new(),
             next_eval: 0,
+            export: None,
         })
     }
 
+    /// Write one CSV row per evaluation to `out` (header first).
+    pub fn export_to(&mut self, mut out: Box<dyn std::io::Write>) -> Result<(), Error> {
+        writeln!(out, "{EXPORT_HEADER}")?;
+        self.export = Some(out);
+        Ok(())
+    }
+
     pub fn update(&mut self, ev: &Event) {
+        let msg = parse_message(ev);
+        self.update_parsed(ev, msg.as_ref());
+    }
+
+    /// Same as `update`, for callers that already parsed the message inside
+    /// the event (see `parse_message`). A sweep parses each message once and
+    /// hands it to many simulators.
+    pub fn update_parsed(&mut self, ev: &Event, msg: Option<&Value>) {
         self.now = ev.ts;
         self.fill_due_orders();
-        match &ev.kind {
-            Kind::WsIn(text) if ev.conn == COINBASE_CONN => self.on_coinbase(text),
-            Kind::WsIn(text) if ev.conn == POLY_WS_CONN => self.on_polymarket(text),
-            Kind::Other(name, data) if name == "market" => self.on_market(data),
-            Kind::Other(name, data) if name == "resolution" => {
+        match (&ev.kind, msg) {
+            (Kind::WsIn(_), Some(v)) if ev.conn == COINBASE_CONN => self.on_coinbase(v),
+            (Kind::WsIn(_), Some(v)) if ev.conn == POLY_WS_CONN => self.on_polymarket(v),
+            (Kind::Other(name, data), _) if name == "market" => self.on_market(data),
+            (Kind::Other(name, data), _) if name == "resolution" => {
                 if let (Some(s), Some(w)) = (data["start"].as_u64(), data["up_won"].as_bool()) {
                     self.windows.entry(s).or_default().up_won = Some(w);
                 }
@@ -126,8 +186,7 @@ impl Sim {
         }
     }
 
-    fn on_coinbase(&mut self, text: &str) {
-        let Ok(v) = serde_json::from_str::<Value>(text) else { return };
+    fn on_coinbase(&mut self, v: &Value) {
         if v["type"] != "ticker" {
             return;
         }
@@ -137,6 +196,13 @@ impl Sim {
         self.spot = Some(mid);
         let sec = self.now / NS;
         self.vol.sample(sec, mid);
+        match self.seconds.back_mut() {
+            Some((s, m)) if *s == sec => *m = mid,
+            _ => self.seconds.push_back((sec, mid)),
+        }
+        while self.seconds.front().is_some_and(|&(s, _)| s + 600 < sec) {
+            self.seconds.pop_front();
+        }
         for w in self.windows.values_mut() {
             if w.open_spot.is_none() && sec >= w.start && sec < w.start + OPEN_TOLERANCE_S {
                 w.open_spot = Some(mid);
@@ -144,21 +210,28 @@ impl Sim {
             if w.close_spot.is_none() && w.end > 0 && sec >= w.end {
                 w.close_spot = Some(mid);
             }
+            // The tick that starts a new second closes the previous one, so
+            // the minute [from, to) is complete once sec >= to.
+            if w.ref_avg.is_none() && w.end > 0 && sec >= w.start && sec < w.start + OPEN_TOLERANCE_S {
+                w.ref_avg = average(&self.seconds, w.start - AVG_S, w.start, MIN_AVG_SAMPLES);
+            }
+            if w.end_avg.is_none() && w.end > 0 && sec >= w.end {
+                w.end_avg = average(&self.seconds, w.end - AVG_S, w.end, MIN_AVG_SAMPLES);
+            }
         }
     }
 
-    fn on_polymarket(&mut self, text: &str) {
-        let Ok(v) = serde_json::from_str::<Value>(text) else { return };
+    fn on_polymarket(&mut self, v: &Value) {
         // A message is one object or a list of them.
         let msgs = match v {
-            Value::Array(a) => a,
+            Value::Array(a) => a.iter().collect(),
             other => vec![other],
         };
         for m in msgs {
             match m["event_type"].as_str() {
                 Some("book") => {
                     if let Some(book) = self.book_mut(m["asset_id"].as_str()) {
-                        book.apply_snapshot(&m);
+                        book.apply_snapshot(m);
                     }
                 }
                 Some("price_change") => {
@@ -192,19 +265,32 @@ impl Sim {
         (w.start, w.end, w.up_token, w.down_token) = (start, end, up, down);
     }
 
-    /// The window in progress right now, if we know its start price.
+    /// The window in progress right now, if we know its reference price.
     fn active_window(&self) -> Option<&Window> {
         let sec = self.now / NS;
-        self.windows.values().find(|w| w.start <= sec && sec < w.end && w.open_spot.is_some())
+        let (first, last) = (self.cfg.first_window, self.cfg.last_window);
+        self.windows.values().find(|w| {
+            w.start <= sec
+                && sec < w.end
+                && w.reference(self.avg_rule).is_some()
+                && w.start >= first
+                && (last == 0 || w.start <= last)
+        })
     }
 
     fn evaluate(&mut self) {
         let Some(spot) = self.spot else { return };
         let Some(w) = self.active_window() else { return };
-        let open = w.open_spot.expect("active windows have an open");
+        let open = w.reference(self.avg_rule).expect("active windows have a reference");
         let seconds_left = (w.end * NS).saturating_sub(self.now) as f64 / NS as f64;
         let sigma = self.vol.sigma();
-        let p_up = model::prob_up(spot, open, sigma, seconds_left);
+        let p_up = if self.avg_rule {
+            // Inside the last minute, part of the final average is known.
+            let partial = average(&self.seconds, w.end - AVG_S, self.now / NS + 1, 1);
+            model::prob_up_avg(spot, open, sigma, seconds_left, AVG_S as f64, partial)
+        } else {
+            model::prob_up(spot, open, sigma, seconds_left)
+        };
         let quote = |b: &PmBook| Quote { bid: b.best_bid(), ask: b.best_ask(), ask_size: b.best_ask_size() };
         let view = View {
             window_start: w.start,
@@ -221,6 +307,24 @@ impl Sim {
         };
         let market = w.up.mid();
         let start = w.start;
+        // Build the CSV row now, while `w` (borrowed from self.windows) is
+        // in hand; write it below, once we're done with `w`.
+        let row = self.export.is_some().then(|| {
+            let f = |x: Option<f64>| x.map_or(String::new(), |v| format!("{v}"));
+            let best_size = |m: &std::collections::BTreeMap<i64, f64>, last: bool| {
+                let v = if last { m.values().next_back() } else { m.values().next() };
+                v.map_or(String::new(), |s| format!("{s}"))
+            };
+            format!(
+                "{},{},{:.3},{},{},{:e},{:.5},{},{},{},{},{},{}",
+                self.now, start, seconds_left, spot, open, sigma, p_up,
+                f(view.up.bid), f(view.up.ask), best_size(&w.up.bids, true), best_size(&w.up.asks, false),
+                f(view.down.bid), f(view.down.ask)
+            )
+        });
+        if let (Some(out), Some(row)) = (self.export.as_mut(), row) {
+            let _ = writeln!(out, "{row}");
+        }
         self.windows.get_mut(&start).expect("exists").forecasts.push((p_up, market));
 
         let due = self.now + self.cfg.latency_ms * 1_000_000;
@@ -259,11 +363,11 @@ impl Sim {
         let mut r = Report { name: self.cfg.name.clone(), start_cash: self.cfg.budget, ..Report::default() };
         let (mut model_sq, mut market_sq) = (0.0, 0.0);
         for (&start, w) in self.windows.iter_mut() {
-            let Some((up_won, official)) = w.result() else { continue };
+            let Some((up_won, official)) = w.result(self.avg_rule) else { continue };
             r.windows += 1;
             if official {
                 r.official += 1;
-                if let Some(proxy) = w.close_spot.zip(w.open_spot).map(|(c, o)| c >= o) {
+                if let Some(proxy) = w.proxy(self.avg_rule) {
                     r.proxy_checked += 1;
                     r.proxy_agreed += (proxy == up_won) as u32;
                 }
@@ -297,6 +401,21 @@ impl Sim {
         r.end_cash = self.paper.cash;
         r
     }
+}
+
+/// The JSON inside a websocket message, if the sim cares about this event.
+pub fn parse_message(ev: &Event) -> Option<Value> {
+    match &ev.kind {
+        Kind::WsIn(text) if ev.conn == COINBASE_CONN || ev.conn == POLY_WS_CONN => serde_json::from_str(text).ok(),
+        _ => None,
+    }
+}
+
+/// Average of the per-second prices in [from, to), if there are at least
+/// `min` of them.
+fn average(seconds: &VecDeque<(u64, f64)>, from: u64, to: u64, min: usize) -> Option<f64> {
+    let (sum, n) = seconds.iter().filter(|(s, _)| *s >= from && *s < to).fold((0.0, 0), |(a, n), (_, m)| (a + m, n + 1));
+    (n >= min && n > 0).then(|| sum / n as f64)
 }
 
 /// What a backtest found.
@@ -371,15 +490,23 @@ mod tests {
             { "event_type": "book", "asset_id": "U", "bids": [{"price": "0.38", "size": "100"}], "asks": [{"price": "0.40", "size": "100"}] },
             { "event_type": "book", "asset_id": "D", "bids": [{"price": "0.58", "size": "100"}], "asks": [{"price": "0.62", "size": "100"}] },
         ]);
-        vec![
+        let mut evs = vec![
             ev(999.0, 21, Kind::Other("market".into(), json!({ "start": 1000, "end": 1300, "up_token": "U", "down_token": "D" }))),
             ev(999.5, POLY_WS_CONN, Kind::WsIn(book.to_string())),
+        ];
+        // A quiet minute before the window: the reference average is 70,000.
+        evs.extend((940..1000).map(|s| ticker(s as f64 + 0.1, 70_000.0)));
+        evs.extend([
             ticker(1000.5, 70_000.0),
             ticker(1100.0, 70_100.0),
             ticker(1101.0, 70_100.0),
             ticker(1301.0, 70_120.0),
-            ev(1400.0, 21, Kind::Other("resolution".into(), json!({ "start": 1000, "up_won": true }))),
-        ]
+        ]);
+        // The last minute averages above 70,000 too (for the proxy result).
+        evs.extend((1240..1302).map(|s| ticker(s as f64 + 0.2, 70_120.0)));
+        evs.push(ev(1400.0, 21, Kind::Other("resolution".into(), json!({ "start": 1000, "up_won": true }))));
+        evs.sort_by_key(|e| e.ts);
+        evs
     }
 
     fn run(cfg: Config) -> Report {

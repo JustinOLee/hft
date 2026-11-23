@@ -2,6 +2,7 @@
 //!
 //!   hft lab record [--minutes N] [DIR]      save live public data to DIR
 //!   hft lab backtest [-v] DIR CONFIG...     run each config over DIR
+//!   hft lab export DIR CONFIG > out.csv     one CSV row per evaluation
 //!
 //! The pieces, in the order data flows through them:
 //!
@@ -31,7 +32,7 @@ use crate::eventlog::now_nanos;
 use crate::queue::EventReader;
 use crate::Error;
 
-const USAGE: &str = "usage: hft lab record [--minutes N] [DIR]\n       hft lab backtest [-v] DIR CONFIG.json...";
+const USAGE: &str = "usage: hft lab record [--minutes N] [DIR]\n       hft lab backtest [-v] DIR CONFIG.json...\n       hft lab export DIR CONFIG.json > out.csv";
 
 pub fn cli(args: &[String]) -> Result<(), Error> {
     match args.first().map(String::as_str) {
@@ -57,23 +58,50 @@ pub fn cli(args: &[String]) -> Result<(), Error> {
             }
             backtest(dir, configs, verbose)
         }
+        Some("export") => {
+            let [_, dir, cfg] = args else { return Err(USAGE.into()) };
+            // Every evaluation becomes a row; the strategy still runs (its
+            // holdings show in nothing here, but config levers apply).
+            let mut sim = sim::Sim::new(config::Config::load(cfg)?)?;
+            sim.export_to(Box::new(std::io::BufWriter::new(std::io::stdout())))?;
+            let mut events = merge::MergedReader::open_dir(dir)?;
+            while let Some(ev) = events.next_event()? {
+                sim.update(&ev);
+            }
+            let r = sim.finish();
+            eprintln!("exported; {} windows with results", r.windows);
+            Ok(())
+        }
         _ => Err(USAGE.into()),
     }
 }
 
 fn backtest(dir: &str, configs: &[&String], verbose: bool) -> Result<(), Error> {
-    let mut reports = Vec::new();
+    let mut sims = Vec::new();
     for path in configs {
         let mut cfg = config::Config::load(path)?;
         cfg.verbose |= verbose;
-        let mut sim = sim::Sim::new(cfg)?;
-        // Each config re-reads the session from disk, from the start.
-        let mut events = merge::MergedReader::open_dir(dir)?;
-        while let Some(ev) = events.next_event()? {
-            sim.update(&ev);
+        // Command-line overrides, for train/test splits without editing files.
+        if let Ok(v) = std::env::var("LAB_FIRST_WINDOW") {
+            cfg.first_window = v.parse()?;
         }
-        reports.push(sim.finish());
+        if let Ok(v) = std::env::var("LAB_LAST_WINDOW") {
+            cfg.last_window = v.parse()?;
+        }
+        sims.push(sim::Sim::new(cfg)?);
     }
+    // Read (and parse) the session ONCE, handing each event to every
+    // config's simulator. Parsing is most of the work, so a sweep of 20
+    // configs costs little more than one. The sims share nothing, so each
+    // gets exactly the result it would get alone.
+    let mut events = merge::MergedReader::open_dir(dir)?;
+    while let Some(ev) = events.next_event()? {
+        let msg = sim::parse_message(&ev);
+        for sim in &mut sims {
+            sim.update_parsed(&ev, msg.as_ref());
+        }
+    }
+    let reports: Vec<sim::Report> = sims.into_iter().map(|s| s.finish()).collect();
 
     let r0 = &reports[0];
     println!(

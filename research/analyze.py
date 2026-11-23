@@ -118,10 +118,22 @@ def model_twap(spot, open_, sigma, elapsed, secs_left, running_avg):
     return phi((mean - open_) / sd)
 
 
+def model_twap60(spot, ref_avg, sigma, secs_to_last_minute):
+    """What the market really settles on (found in E2): the AVERAGE price over
+    the window's last minute vs the AVERAGE over the minute before it began.
+
+    The reference average is already known when the window starts. The final
+    average is still random: BTC first wanders for `secs_to_last_minute`,
+    then we average over 60 s. Averaging a random walk over 60 s adds only
+    a third of 60 s worth of variance (that's where the 60/3 comes from)."""
+    var_s = max(secs_to_last_minute, 0.0) + 60.0 / 3.0
+    return phi(math.log(spot / ref_avg) / (sigma * math.sqrt(var_s)))
+
+
 # ------------------------------------------------------------- the samples --
 
 
-def samples(windows, spot, halflife=60, sigma_mult=1.0, rule="point"):
+def samples(windows, spot, halflife=60, sigma_mult=1.0, rule="twap60", hour_scale=None):
     """One row per (window, Polymarket price point inside the window)."""
     rows = []
     for w in windows:
@@ -139,8 +151,15 @@ def samples(windows, spot, halflife=60, sigma_mult=1.0, rule="point"):
             if px is None or not sig:
                 continue
             sig *= sigma_mult
+            if hour_scale:
+                sig *= hour_scale[(m // 3600) % 24]
             left = S + WINDOW - t
-            if rule == "point":
+            if rule == "twap60":
+                ref = spot.mean_of(S - 60)
+                if ref is None:
+                    continue
+                p_mod = model_twap60(px, ref, sig, S + WINDOW - 60 - m)
+            elif rule == "point":
                 p_mod = model_point(px, open_, sig, left)
             else:
                 elapsed_min = list(range(S, m, 60))
@@ -151,6 +170,18 @@ def samples(windows, spot, halflife=60, sigma_mult=1.0, rule="point"):
                 p_mod = model_twap(px, open_, sig, m - S, S + WINDOW - m, run)
             rows.append(dict(start=S, t=t, left=left, y=y, mkt=p_mkt, mod=p_mod, px=px, open=open_, sig=sig))
     return rows
+
+
+def hour_scales(spot, until):
+    """How jumpy each UTC hour is compared with the average hour, measured
+    only on minutes before `until` (the training data)."""
+    hours = defaultdict(list)
+    for m in spot.mins:
+        a = spot.c.get(m - 60)
+        if a and m < until:
+            hours[(m // 3600) % 24].append(math.log(spot.c[m][2] / a[2]) ** 2)
+    overall = sum(sum(v) for v in hours.values()) / sum(len(v) for v in hours.values())
+    return {h: math.sqrt(sum(v) / len(v) / overall) for h, v in hours.items()}
 
 
 def split(windows):
@@ -236,6 +267,9 @@ def main():
         "end price >= start price": lambda S: spot.close_of(S + 240) >= spot.open_at(S),
         "window average >= start price": lambda S: sum(spot.mean_of(S + 60 * k) for k in range(5)) / 5 >= spot.open_at(S),
         "last-minute avg >= first-minute-before avg": lambda S: spot.mean_of(S + 240) >= spot.mean_of(S - 60),
+        "last-minute avg >= start price": lambda S: spot.mean_of(S + 240) >= spot.open_at(S),
+        "end price >= minute-before avg": lambda S: spot.close_of(S + 240) >= spot.mean_of(S - 60),
+        "last-minute avg >= first-minute avg": lambda S: spot.mean_of(S + 240) >= spot.mean_of(S),
     }
     for name, rule in rules.items():
         agree = n = 0
@@ -278,7 +312,7 @@ def main():
 
     # E4: model vs market, by time left --------------------------------------
     print("# E4. Our model vs the market (Brier score, lower is better)")
-    for rule in ("point", "twap"):
+    for rule in ("point", "twap", "twap60"):
         rws = samples(windows, spot, rule=rule)
         print(f"  model settles on: {rule}")
         by = defaultdict(list)
@@ -309,12 +343,17 @@ def main():
     print(f"  best on train: half-life {hl} min, x{mult}")
     print(f"  test: tuned {fmt(brier([(r['mod'], r['y']) for r in te]))}  "
           f"default {fmt(brier([(r['mod'], r['y']) for r in te0]))}  "
-          f"market {fmt(brier([(r['mkt'], r['y']) for r in te]))}\n")
+          f"market {fmt(brier([(r['mkt'], r['y']) for r in te]))}")
+    hs = hour_scales(spot, test[0]["start"])
+    teh = samples(test, spot, hl, mult, hour_scale=hs)
+    print(f"  + time-of-day volatility (hour factors {min(hs.values()):.2f}..{max(hs.values()):.2f}): "
+          f"test {fmt(brier([(r['mod'], r['y']) for r in teh]))}\n")
 
     # E6: does the model add anything to the market price? -------------------
     print("# E6. Blend: does our model know anything the market doesn't?")
     tr = samples(train, spot, hl, mult)
     feats = lambda r: [1.0, logit(r["mkt"]), logit(r["mod"])]
+    te = samples(test, spot, hl, mult)
     b = fit_logistic([feats(r) for r in tr], [r["y"] for r in tr])
     bm = fit_logistic([[1.0, logit(r["mkt"])] for r in tr], [r["y"] for r in tr])
     print(f"  fitted weights: market {b[1]:.3f}, model {b[2]:.3f}  (model weight ~0 = no extra info)")
@@ -338,6 +377,50 @@ def main():
         if pnl:
             wins = sum(p > 0 for p in pnl) / len(pnl)
             print(f"  {edge:.2f}   {len(pnl):>6}   {wins*100:5.1f}   {sum(pnl)/len(pnl):+.4f}     {sum(pnl):+.2f}")
+    print()
+
+    # E9: the small "Up is overpriced" bias from E3, as a trade --------------
+    print("# E9. E3 showed Up winning ~2c less than its price in the middle. Tradeable?")
+    print("  rule: buy Down at (1 - Up price) + 1c whenever Up price is in [lo, hi]; fee 0.05*p*(1-p)")
+    print("  range        set     trades  Down win%   avg Down price   pnl/share")
+    for lo, hi in ((0.40, 0.60), (0.45, 0.65), (0.50, 0.60)):
+        for name, ws in (("train", train), ("test", test)):
+            res = []
+            for r in samples(ws, spot):
+                if lo <= r["mkt"] <= hi:
+                    price = 1 - r["mkt"] + 0.01
+                    res.append(((1 - r["y"]) - price - 0.05 * price * (1 - price), price, 1 - r["y"]))
+            if res:
+                n = len(res)
+                print(f"  {lo:.2f}-{hi:.2f}    {name:<5}  {n:>6}   {sum(x[2] for x in res)/n*100:5.1f}       "
+                      f"{sum(x[1] for x in res)/n:.3f}          {sum(x[0] for x in res)/n:+.4f}")
+    print()
+
+    # E10: how much of the gap is just our stale price? ----------------------
+    print("# E10. Gap to the market vs how old our spot price is")
+    print("  (our price is the candle open at the start of the minute; the market's price is at t)")
+    rows = samples(windows, spot, hl, mult)
+    by = defaultdict(list)
+    for r in rows:
+        by[min(int((r["t"] % 60) // 15), 3)].append(r)
+    for k in sorted(by):
+        g = by[k]
+        bm, bk = brier([(r["mod"], r["y"]) for r in g]), brier([(r["mkt"], r["y"]) for r in g])
+        print(f"  {15*k:>2}-{15*k+15:<2} s old: model {fmt(bm)}  market {fmt(bk)}  gap {bm-bk:+.4f}  n={len(g)}")
+    print()
+
+    # E11: is the new model calibrated? ---------------------------------------
+    print("# E11. Calibration of the twap60 model (all data)")
+    cal = defaultdict(lambda: [0.0, 0.0, 0])
+    for r in rows:
+        b = min(int(r["mod"] * 10), 9)
+        cal[b][0] += r["mod"]
+        cal[b][1] += r["y"]
+        cal[b][2] += 1
+    print("  model says   Up actually won    n")
+    for b in sorted(cal):
+        sm, yy, n = cal[b]
+        print(f"  {sm/n:.3f}        {yy/n:.3f}           {n}")
     print()
 
     # E8: time of day ---------------------------------------------------------

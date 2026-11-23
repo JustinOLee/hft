@@ -2,10 +2,13 @@
 //!
 //! Two feeds, each on its own thread, each writing its own log file:
 //!
-//!   coinbase.log    BTC-USD ticker from Coinbase (the "spot" price)
-//!   polymarket.log  order books for Polymarket's 5-minute
+//!   coinbase.log.gz    BTC-USD ticker from Coinbase (the "spot" price)
+//!   polymarket.log.gz  order books for Polymarket's 5-minute
 //!                   "Bitcoin Up or Down" markets, plus which market is which
 //!                   ("market" events) and how each one ended ("resolution")
+//!
+//! Files are gzip-compressed (about 10x smaller; Polymarket's feed is
+//! ~3 GB/hour raw). `gunzip -c file.gz | less` to read one.
 //!
 //! A session is a folder of these files. merge.rs reads them back as one
 //! stream, in time order, so backtests see events exactly as they happened.
@@ -50,8 +53,8 @@ pub fn record(dir: &str, minutes: Option<u64>) -> Result<(), Error> {
     session.write(SESSION_CONN, "start", json!({ "window_s": WINDOW_S, "minutes": minutes }))?;
     eprintln!("recording to {dir}/ {}", minutes.map_or("until Ctrl-C".into(), |m| format!("for {m} min")));
 
-    let mut cb_log = EventLog::create(&format!("{dir}/coinbase.log"))?;
-    let mut pm_log = EventLog::create(&format!("{dir}/polymarket.log"))?;
+    let mut cb_log = EventLog::create(&format!("{dir}/coinbase.log.gz"))?;
+    let mut pm_log = EventLog::create(&format!("{dir}/polymarket.log.gz"))?;
     let cb = thread::spawn(move || keep_running("coinbase", &mut cb_log, deadline, coinbase_once));
     let mut pm = Polymarket::new();
     let pm = thread::spawn(move || {

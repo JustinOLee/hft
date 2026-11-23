@@ -34,12 +34,22 @@ pub struct Config {
     pub no_trade_last_s: f64,
 
     // ---- Model ----
-    /// Volatility estimate's half-life, seconds (see vol.rs).
+    /// Settlement rule the fair value assumes: "avg60" (last-minute average
+    /// vs the minute-before-start average: what the market really uses) or
+    /// "point" (end price vs start price: the first, simpler guess).
+    pub model: String,
+    /// Volatility estimate's half-life, seconds (see vol.rs). 30 min tested
+    /// best on 30 days of history (RESEARCH.md, E5), though it matters little.
     pub vol_halflife_s: f64,
     /// Starting volatility guess, per sqrt(second). 1e-4 is about 50%/year.
     pub vol_prior: f64,
 
     // ---- Simulation ----
+    /// Only trade and score windows starting in [first_window, last_window]
+    /// (unix seconds; 0 = no limit). Lets you tune on one part of a
+    /// recording and test on another.
+    pub first_window: u64,
+    pub last_window: u64,
     /// Pretend each order takes this long to reach the exchange. Fills use
     /// the book as it was then, not when we decided.
     pub latency_ms: u64,
@@ -60,8 +70,11 @@ impl Default for Config {
             shares: 10.0,
             max_shares: 100.0,
             no_trade_last_s: 10.0,
-            vol_halflife_s: 120.0,
+            model: "avg60".into(),
+            vol_halflife_s: 1800.0,
             vol_prior: 1e-4,
+            first_window: 0,
+            last_window: 0,
             latency_ms: 100,
             eval_ms: 1000,
             verbose: false,
