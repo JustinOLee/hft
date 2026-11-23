@@ -45,9 +45,10 @@ pub enum Kind {
     WsIn(String),
     WsClose,
     TcpClose(String),
-    /// Anything we don't model yet (pings, pongs, ...). Kept rather than
-    /// rejected so old state machines can read newer logs.
-    Other(String),
+    /// Any other kind, with its name and data. The lab's recorder uses this
+    /// for "market" and "resolution" events. Kept rather than rejected so
+    /// old state machines can read newer logs.
+    Other(String, Value),
 }
 
 impl Event {
@@ -75,7 +76,7 @@ impl Event {
             "ws_in" => Kind::WsIn(text()),
             "ws_close" => Kind::WsClose,
             "tcp_close" => Kind::TcpClose(text()),
-            other => Kind::Other(other.to_string()),
+            other => Kind::Other(other.to_string(), v["data"].clone()),
         };
         Ok(Event { ts, conn, kind })
     }

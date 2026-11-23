@@ -10,3 +10,7 @@
 secrets/
 *.secret.*
 config.local.*
+
+# Recorded market data (big, and regenerable)
+/data/
+/research/data/

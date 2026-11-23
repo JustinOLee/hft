@@ -630,6 +630,86 @@ to sleeping.
 
 ---
 
+## Checkpoint, then skipping ahead to the lab (step 15 and beyond)
+
+Steps 1–9 are tagged in git as **`checkpoint-1-trading-core`**. To look at
+the code exactly as it was then: `git checkout checkpoint-1-trading-core`
+(and `git checkout main` to come back).
+
+Instead of going straight to step 10 (market making with real money), we
+jumped ahead to the *thinking* part: **how do you predict a market at
+all?** The plan is in [LAB.md](LAB.md), and a map of the main kinds of
+strategy is in [STRATEGIES.md](STRATEGIES.md).
+
+### Why a "lab"?
+
+To learn what moves a market, you want to try lots of ideas quickly,
+on real data, without risking money. So the lab:
+
+1. **records** real public data to files, once, and
+2. **backtests**: replays those files through a fake ("paper") trading
+   account as often as you like, with different settings.
+
+Because the backtest follows the same rules as our trading state machine
+(no clock, no randomness, "now" = the event's time), the same data and the
+same settings always give the same answer. So when you change one setting
+and the result changes, you know that setting caused it.
+
+### The market: Bitcoin up or down in 5 minutes
+
+Polymarket opens a new market every 5 minutes: *"Will Bitcoin end this
+window at or above where it started?"* Up and Down each pay $1 if they win.
+
+We record two things:
+- **Coinbase BTC-USD** (the "spot" price: what Bitcoin costs right now)
+- **Polymarket's order books** for the current and next window, plus
+  which market is which, and how each one ended
+
+Polymarket doesn't let US residents trade, so we only *read* its public
+data. Kalshi has a similar market every 15 minutes (`KXBTC15M`), which is
+where real money could go later.
+
+### The simplest model that makes sense
+
+If BTC moves randomly, the chance it ends up depends on three things:
+how far it is above or below the start price, how much time is left, and
+how jumpy it is. With a jumpiness of `sigma` per second, in `t` seconds
+BTC typically moves about `sigma × √t`. So:
+
+```
+P(up) = Phi( ln(spot / open) / (sigma × √seconds_left) )
+```
+
+`Phi` turns "how many typical moves above the start" into a probability:
+0 → 50%, +1 → 84%, −2 → 2%. Code: `src/lab/model.rs`.
+
+The jumpiness (**volatility**) is measured from the last few minutes of
+Coinbase prices (`src/lab/vol.rs`).
+
+### The paper account
+
+`src/lab/paper.rs` pretends to buy against the **real recorded order
+book**: cheapest sellers first, never more shares than were actually
+offered, minus a fee. It also waits `latency_ms` before filling, using the
+book as it was *then*, because real orders take time to arrive. When the
+window ends, each winning share pays $1.
+
+### How we score a forecast
+
+The **Brier score** is the average of `(forecast − outcome)²`. Zero is
+perfect, 0.25 is a coin flip. We score our model **and the market's own
+price** at the same moments. If the market scores better, it knows more
+than our model does, which is what you'd expect at first.
+
+### A surprise: how chatty the feed is
+
+Polymarket sends about **600 order book changes per second** for these
+two markets. The traders quoting them adjust constantly. That's about
+**1.5 GB per hour** of raw log. Fine for sessions of an hour or two;
+long recordings will need compression.
+
+---
+
 ## Where we are
 
 | Plan step | Status |
@@ -643,7 +723,8 @@ to sleeping.
 | 7. A proper network loop | ✅ |
 | 8. Measure waiting time | ✅ (Mac version; see below) |
 | 9. A queue between the threads | ✅ |
-| 10. Market making | ⏳ next, after your review |
+| 10. Market making | ⏳ later (needs startup sync + cancel-on-exit first) |
+| 15+. The lab: real data, paper money | 🧪 stage 0 (skeleton) done; see LAB.md |
 
 ## Review guide: a good place to stop and dig in
 
@@ -743,3 +824,13 @@ actually trade (and could lose money), so first:
 | **Sequence number** | a counter on each message, used to detect lost messages |
 | **Private key** | your secret, used to sign requests. Never share it. |
 | **Thread** | one line of work in a program. Two threads run at the same time. |
+| **Backtest** | running a strategy over recorded data to see how it would have done |
+| **Paper trading** | trading with pretend money (against real prices) |
+| **Spot price** | what the thing itself costs right now (here: BTC on Coinbase) |
+| **Volatility** | how jumpy a price is; how far it typically moves in a given time |
+| **Fair value** | what a model thinks a contract is really worth |
+| **Edge** | fair value minus the price you pay; your expected profit per contract |
+| **Taker / Maker** | taker = trades right away against a resting order; maker = leaves an order resting |
+| **Brier score** | how good probability forecasts are; 0 is perfect, 0.25 is a coin flip |
+| **Basis** | the gap between two prices for the same thing (Coinbase vs Chainlink) |
+| **Overfitting** | tuning settings until they fit past luck instead of a real pattern |

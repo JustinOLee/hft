@@ -10,6 +10,7 @@
 //!   cargo run -- live [--test-resync] [--place-cancel] [--test-disconnect] <TICKER>...
 //!   cargo run -- replay [--check-actions] [--place-cancel] <log_path>
 //!   cargo run -- balance            (one signed REST request, for testing)
+//!   cargo run -- lab ...            the paper-trading playground (src/lab/)
 //!
 //! Credentials come from secrets/kalshi.env (override with HFT_SECRETS=path).
 //! The log goes to logs/<unix seconds>.log (override with HFT_LOG=path).
@@ -25,6 +26,7 @@ mod eventlog;
 mod fixed;
 mod http;
 mod kalshi;
+mod lab;
 mod net;
 mod queue;
 mod reactor;
@@ -48,7 +50,8 @@ use queue::{EventReader, FileReader};
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const USAGE: &str = "usage: hft live [--test-resync] [--place-cancel] [--test-disconnect] <TICKER>...\n       \
-                     hft replay [--check-actions] [--place-cancel] <log_path>\n       hft balance";
+                     hft replay [--check-actions] [--place-cancel] <log_path>\n       hft balance\n       \
+                     hft lab record|backtest ... (see src/lab/mod.rs)";
 
 /// Session settings chosen on the command line.
 struct Options {
@@ -82,6 +85,7 @@ fn main() -> Result<(), Error> {
             replay(path, check, strategy)
         }
         Some("balance") => balance(),
+        Some("lab") => lab::cli(&args[1..]),
         _ => Err(USAGE.into()),
     }
 }

@@ -1,0 +1,6 @@
+{
+  "strategy": "fair_value_taker",
+  "edge": 0.05,
+  "shares": 10,
+  "max_shares": 100
+}

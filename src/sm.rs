@@ -184,7 +184,7 @@ impl StateMachine {
             Kind::WsClose | Kind::TcpClose(_) => self.on_close(ev.conn),
             Kind::WsIn(text) => self.on_message(text),
             Kind::Action(action) => self.on_own_action(action),
-            Kind::WsOut(_) | Kind::Timer | Kind::Other(_) => {}
+            Kind::WsOut(_) | Kind::Timer | Kind::Other(..) => {}
         }
         self.run_strategy();
         std::mem::take(&mut self.out)
