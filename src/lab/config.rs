@@ -60,6 +60,8 @@ pub struct Config {
     /// Pretend each order takes this long to reach the exchange. Fills use
     /// the book as it was then, not when we decided.
     pub latency_ms: u64,
+    /// Don't trade if the BTC price is older than this (dead feed guard).
+    pub max_spot_age_ms: u64,
     /// Ask the strategy what to do this often (event time).
     pub eval_ms: u64,
     /// Print every decision and fill.
@@ -86,6 +88,7 @@ impl Default for Config {
             last_window: 0,
             latency_ms: 100,
             eval_ms: 1000,
+            max_spot_age_ms: 5000,
             verbose: false,
         }
     }

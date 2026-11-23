@@ -123,6 +123,8 @@ pub struct Sim {
     strat: Box<dyn Strategy>,
     now: u64,
     spot: Option<f64>,
+    /// When `spot` last changed (event time).
+    spot_ts: u64,
     /// Latest mid on each exchange, and which of them make up `spot`.
     coinbase_mid: Option<f64>,
     kraken_mid: Option<f64>,
@@ -167,6 +169,7 @@ impl Sim {
             cfg,
             now: 0,
             spot: None,
+            spot_ts: 0,
             coinbase_mid: None,
             kraken_mid: None,
             spot_source,
@@ -253,6 +256,7 @@ impl Sim {
             _ => return, // the chosen source(s) haven't spoken yet
         };
         self.spot = Some(mid);
+        self.spot_ts = self.now;
         let sec = self.now / NS;
         self.vol.sample(sec, mid);
         match self.seconds.back_mut() {
@@ -425,6 +429,17 @@ impl Sim {
 
     fn evaluate(&mut self) {
         let Some(spot) = self.spot else { return };
+        // Stale-data guard: if the BTC price has stopped updating, the feed
+        // may be dead (it happened, see feeds.rs Watchdog). Trading on a
+        // frozen price is how bots lose money fast, so sit out, and cancel
+        // resting orders.
+        if self.now.saturating_sub(self.spot_ts) > self.cfg.max_spot_age_ms * 1_000_000 {
+            let due = self.now + self.cfg.latency_ms * 1_000_000;
+            for r in self.resting.iter_mut() {
+                r.dead_from = r.dead_from.min(due);
+            }
+            return;
+        }
         let Some(w) = self.active_window() else { return };
         let open = w.reference(self.avg_rule).expect("active windows have a reference");
         let seconds_left = (w.end * NS).saturating_sub(self.now) as f64 / NS as f64;

@@ -133,10 +133,49 @@ fn ws_send(log: &mut EventLog, conn: u64, ws: &mut Ws, text: String) -> Result<(
     Ok(())
 }
 
+/// A connection can die without closing: after a network blip, the socket
+/// stays "open" but nothing ever arrives again. From the inside, that looks
+/// exactly like a quiet market. (This happened: both spot feeds went silent
+/// for hours while we waited politely.) So every feed has a watchdog: ping
+/// the server when it's been quiet, and reconnect if it stays silent.
+struct Watchdog {
+    last_msg: Instant,
+    last_ping: Instant,
+}
+
+const PING_AFTER: Duration = Duration::from_secs(5);
+const DEAD_AFTER: Duration = Duration::from_secs(20);
+
+impl Watchdog {
+    fn new() -> Watchdog {
+        Watchdog { last_msg: Instant::now(), last_ping: Instant::now() }
+    }
+
+    /// Call once per loop. Sends a websocket ping when quiet; errors out
+    /// (so keep_running reconnects) when silent too long.
+    fn check(&mut self, log: &mut EventLog, conn: u64, ws: &mut Ws) -> Result<(), Error> {
+        if self.last_msg.elapsed() >= DEAD_AFTER {
+            log.write(conn, "tcp_close", json!("watchdog: no data, reconnecting"))?;
+            return Err(format!("no data for {DEAD_AFTER:?}, assuming the connection is dead").into());
+        }
+        if self.last_msg.elapsed() >= PING_AFTER && self.last_ping.elapsed() >= PING_AFTER {
+            // Any reply (a pong) counts as life; see ws_read.
+            ws.send(Message::Ping(Vec::new().into()))?;
+            self.last_ping = Instant::now();
+        }
+        Ok(())
+    }
+}
+
 /// Next text message, or None if a second passed with nothing (or the
 /// message wasn't text: tungstenite answers pings by itself).
-fn ws_read(log: &mut EventLog, conn: u64, ws: &mut Ws) -> Result<Option<String>, Error> {
-    match ws.read() {
+/// Anything at all from the server, pongs included, feeds the watchdog.
+fn ws_read(log: &mut EventLog, conn: u64, ws: &mut Ws, dog: &mut Watchdog) -> Result<Option<String>, Error> {
+    let r = ws.read();
+    if r.is_ok() {
+        dog.last_msg = Instant::now();
+    }
+    match r {
         Ok(Message::Text(t)) => Ok(Some(t.to_string())),
         Ok(Message::Close(frame)) => {
             log.write(conn, "ws_close", json!(format!("{frame:?}")))?;
@@ -163,8 +202,10 @@ fn coinbase_once(log: &mut EventLog, deadline: Option<Instant>) -> Result<(), Er
     // "ticker" sends best bid/ask and last price after every trade.
     let sub = json!({ "type": "subscribe", "product_ids": ["BTC-USD"], "channels": ["ticker"] });
     ws_send(log, COINBASE_CONN, &mut ws, sub.to_string())?;
+    let mut dog = Watchdog::new();
     while !past(deadline) {
-        if let Some(text) = ws_read(log, COINBASE_CONN, &mut ws)? {
+        dog.check(log, COINBASE_CONN, &mut ws)?;
+        if let Some(text) = ws_read(log, COINBASE_CONN, &mut ws, &mut dog)? {
             log.write(COINBASE_CONN, "ws_in", json!(text))?;
         }
     }
@@ -182,8 +223,10 @@ fn kraken_once(log: &mut EventLog, deadline: Option<Instant>) -> Result<(), Erro
     // "ticker" sends the best bid/ask whenever they change.
     let sub = json!({ "method": "subscribe", "params": { "channel": "ticker", "symbol": ["BTC/USD"], "event_trigger": "bbo" } });
     ws_send(log, KRAKEN_CONN, &mut ws, sub.to_string())?;
+    let mut dog = Watchdog::new();
     while !past(deadline) {
-        if let Some(text) = ws_read(log, KRAKEN_CONN, &mut ws)? {
+        dog.check(log, KRAKEN_CONN, &mut ws)?;
+        if let Some(text) = ws_read(log, KRAKEN_CONN, &mut ws, &mut dog)? {
             log.write(KRAKEN_CONN, "ws_in", json!(text))?;
         }
     }
@@ -238,14 +281,16 @@ impl Polymarket {
         let mut ws = ws_connect(log, POLY_WS_CONN, POLY_WS_HOST, "/ws/market")?;
         ws_send(log, POLY_WS_CONN, &mut ws, json!({ "assets_ids": tokens, "type": "market" }).to_string())?;
         let mut last_ping = Instant::now();
+        let mut dog = Watchdog::new();
         while !past(deadline) && now_s() / WINDOW_S * WINDOW_S == window {
+            dog.check(log, POLY_WS_CONN, &mut ws)?;
             // Polymarket drops connections that stay silent; it wants a
             // "PING" text message about every 10 seconds.
             if last_ping.elapsed() >= Duration::from_secs(10) {
                 ws_send(log, POLY_WS_CONN, &mut ws, "PING".into())?;
                 last_ping = Instant::now();
             }
-            if let Some(text) = ws_read(log, POLY_WS_CONN, &mut ws)? {
+            if let Some(text) = ws_read(log, POLY_WS_CONN, &mut ws, &mut dog)? {
                 log.write(POLY_WS_CONN, "ws_in", json!(text))?;
             }
         }

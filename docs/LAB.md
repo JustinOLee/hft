@@ -118,6 +118,7 @@ All in a JSON file (see `lab/configs/`). Anything left out keeps its default.
 | `vol_prior` | 1e-4 | starting volatility guess per √second (~50%/year) | |
 | `latency_ms` | 100 | pretend order travel time | 0, 500, 2000 |
 | `eval_ms` | 1000 | how often the strategy is asked | 100, 5000 |
+| `max_spot_age_ms` | 5000 | sit out (and cancel resting orders) if the BTC price is older than this | |
 | `first_window` / `last_window` | 0 | only trade/score windows in this range (unix s; 0 = all) | train/test split |
 | `verbose` | false | print every decision and fill (or pass `-v`) | |
 

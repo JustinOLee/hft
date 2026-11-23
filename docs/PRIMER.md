@@ -737,6 +737,23 @@ Full write-up: [RESEARCH.md](RESEARCH.md). The lessons, in short:
   history and run the experiments. Rust stays for the trading code; Python
   is quicker for one-off questions about data.
 
+### A lesson from the 8-hour recording: silence isn't success
+
+Half an hour into an 8-hour recording, both BTC price feeds (Coinbase and
+Kraken) went silent at the same moment, probably after a brief network
+blip. Their connections never closed. They just stopped delivering
+anything, and the recorder waited politely for hours. Polymarket's feed
+survived only because it reconnects every 5 minutes anyway.
+
+From the inside, **a dead connection looks exactly like a quiet market.**
+Real trading systems guard against this in two places, and now so do we:
+
+1. **Watchdog (recorder):** if a feed has been quiet for 5 s, send a ping;
+   if nothing at all comes back for 20 s, assume it's dead and reconnect.
+2. **Stale-data guard (simulator):** if the BTC price is more than 5 s old,
+   don't trade, and cancel resting orders. A bot trading on a frozen price
+   is a classic way to lose money fast.
+
 ---
 
 ## Where we are
