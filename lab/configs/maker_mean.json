@@ -1,0 +1,5 @@
+{
+  "strategy": "fair_value_maker",
+  "edge": 0.02,
+  "spot_source": "mean"
+}

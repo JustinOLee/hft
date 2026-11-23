@@ -253,6 +253,28 @@ def main():
     print(f"# Data\n{len(windows)} settled windows over {days:.1f} days "
           f"({len(train)} train / {len(test)} test); {len(candles)} Coinbase minutes\n")
 
+    # E12: does a second exchange track the settlement price better? ------
+    import os
+    bpath = f"{d}/bitstamp.jsonl"
+    if os.path.exists(bpath):
+        bs = {}
+        with open(bpath) as f:
+            for line in f:
+                t, lo, hi, op, cl, vol = json.loads(line)
+                bs[t] = (lo, hi, op, cl, vol)
+        both = {t: tuple((a + b) / 2 for a, b in zip(candles[t], bs[t])) for t in candles if t in bs}
+        print("# E12. Which price source best matches the official results? (E2's rule)")
+        for name, src in (("Coinbase", candles), ("Bitstamp", bs), ("average of both", both)):
+            sp = Spot(src)
+            agree = n = 0
+            for w in windows:
+                a, b = sp.mean_of(w["start"] + 240), sp.mean_of(w["start"] - 60)
+                if a is not None and b is not None and w["start"] + 240 in both and w["start"] - 60 in both:
+                    agree += (a >= b) == w["up_won"]
+                    n += 1
+            print(f"  {name:<16} agrees {agree/n:.4f} of {n}")
+        print()
+
     # E1: base rate and streaks -------------------------------------------
     ups = sum(w["up_won"] for w in windows)
     print("# E1. Base rate and momentum between windows")

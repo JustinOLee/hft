@@ -17,10 +17,10 @@ use serde_json::Value;
 
 use crate::event::{Event, Kind};
 use crate::lab::config::Config;
-use crate::lab::feeds::{COINBASE_CONN, POLY_WS_CONN};
+use crate::lab::feeds::{COINBASE_CONN, KRAKEN_CONN, POLY_WS_CONN};
 use crate::lab::model;
 use crate::lab::paper::Paper;
-use crate::lab::pmbook::PmBook;
+use crate::lab::pmbook::{to_ticks, PmBook};
 use crate::lab::strategy::{self, Intent, Outcome, Quote, Strategy, View};
 use crate::lab::vol::Vol;
 use crate::Error;
@@ -102,11 +102,31 @@ struct Pending {
     intent: Intent,
 }
 
+/// A maker order resting in the (simulated) book.
+///
+/// It reaches the exchange `latency_ms` after the decision, and a cancel
+/// also takes `latency_ms` to arrive. In between it can be filled, even if
+/// we've already decided it's a bad price: that's how quotes get "picked off".
+struct Resting {
+    live_from: u64,
+    dead_from: u64,
+    window: u64,
+    outcome: Outcome,
+    price: f64,
+    remaining: f64,
+    /// Checked for post-only when it first goes live.
+    checked: bool,
+}
+
 pub struct Sim {
     cfg: Config,
     strat: Box<dyn Strategy>,
     now: u64,
     spot: Option<f64>,
+    /// Latest mid on each exchange, and which of them make up `spot`.
+    coinbase_mid: Option<f64>,
+    kraken_mid: Option<f64>,
+    spot_source: SpotSource,
     /// The latest mid in each of the last few hundred seconds: (second, mid).
     seconds: VecDeque<(u64, f64)>,
     /// True for the "avg60" settlement rule, false for "point".
@@ -117,6 +137,7 @@ pub struct Sim {
     tokens: BTreeMap<String, (u64, Outcome)>,
     paper: Paper,
     pending: Vec<Pending>,
+    resting: Vec<Resting>,
     next_eval: u64,
     /// If set, every evaluation is also written here as a CSV row.
     export: Option<Box<dyn std::io::Write>>,
@@ -133,6 +154,12 @@ impl Sim {
             "point" => false,
             other => return Err(format!("unknown model {other:?} (use \"avg60\" or \"point\")").into()),
         };
+        let spot_source = match cfg.spot_source.as_str() {
+            "coinbase" => SpotSource::Coinbase,
+            "kraken" => SpotSource::Kraken,
+            "mean" => SpotSource::Mean,
+            other => return Err(format!("unknown spot_source {other:?} (coinbase, kraken, mean)").into()),
+        };
         Ok(Sim {
             strat: strategy::build(&cfg)?,
             vol: Vol::new(cfg.vol_prior, cfg.vol_halflife_s),
@@ -140,11 +167,15 @@ impl Sim {
             cfg,
             now: 0,
             spot: None,
+            coinbase_mid: None,
+            kraken_mid: None,
+            spot_source,
             seconds: VecDeque::new(),
             avg_rule,
             windows: BTreeMap::new(),
             tokens: BTreeMap::new(),
             pending: Vec::new(),
+            resting: Vec::new(),
             next_eval: 0,
             export: None,
         })
@@ -168,9 +199,15 @@ impl Sim {
     pub fn update_parsed(&mut self, ev: &Event, msg: Option<&Value>) {
         self.now = ev.ts;
         self.fill_due_orders();
+        let now = self.now;
+        let windows = &self.windows;
+        self.resting.retain(|r| {
+            r.dead_from > now && r.remaining > 0.0 && windows.get(&r.window).is_none_or(|w| now < w.end * NS)
+        });
         match (&ev.kind, msg) {
             (Kind::WsIn(_), Some(v)) if ev.conn == COINBASE_CONN => self.on_coinbase(v),
             (Kind::WsIn(_), Some(v)) if ev.conn == POLY_WS_CONN => self.on_polymarket(v),
+            (Kind::WsIn(_), Some(v)) if ev.conn == KRAKEN_CONN => self.on_kraken(v),
             (Kind::Other(name, data), _) if name == "market" => self.on_market(data),
             (Kind::Other(name, data), _) if name == "resolution" => {
                 if let (Some(s), Some(w)) = (data["start"].as_u64(), data["up_won"].as_bool()) {
@@ -192,7 +229,29 @@ impl Sim {
         }
         let num = |k: &str| v[k].as_str().and_then(|s| s.parse::<f64>().ok());
         let (Some(bid), Some(ask)) = (num("best_bid"), num("best_ask")) else { return };
-        let mid = (bid + ask) / 2.0;
+        self.coinbase_mid = Some((bid + ask) / 2.0);
+        self.on_spot_change();
+    }
+
+    /// Kraken v2 ticker: {"channel":"ticker","data":[{"bid":..,"ask":..}]}
+    /// (numbers, not strings, unlike Coinbase).
+    fn on_kraken(&mut self, v: &Value) {
+        if v["channel"] != "ticker" {
+            return;
+        }
+        let d = &v["data"][0];
+        let (Some(bid), Some(ask)) = (d["bid"].as_f64(), d["ask"].as_f64()) else { return };
+        self.kraken_mid = Some((bid + ask) / 2.0);
+        self.on_spot_change();
+    }
+
+    fn on_spot_change(&mut self) {
+        let mid = match (self.spot_source, self.coinbase_mid, self.kraken_mid) {
+            (SpotSource::Coinbase, Some(c), _) => c,
+            (SpotSource::Kraken, _, Some(k)) => k,
+            (SpotSource::Mean, Some(c), Some(k)) => (c + k) / 2.0,
+            _ => return, // the chosen source(s) haven't spoken yet
+        };
         self.spot = Some(mid);
         let sec = self.now / NS;
         self.vol.sample(sec, mid);
@@ -222,6 +281,11 @@ impl Sim {
     }
 
     fn on_polymarket(&mut self, v: &Value) {
+        // Orders that just reached the exchange get their post-only check
+        // against the book as it was, before this message changes it.
+        if !self.resting.is_empty() {
+            self.check_book_crosses();
+        }
         // A message is one object or a list of them.
         let msgs = match v {
             Value::Array(a) => a.iter().collect(),
@@ -241,7 +305,88 @@ impl Sim {
                         }
                     }
                 }
-                _ => {} // last_trade_price, tick_size_change: TODO use trades as a signal
+                Some("last_trade_price") => self.on_trade(m),
+                _ => {} // tick_size_change
+            }
+        }
+        if !self.resting.is_empty() {
+            self.check_book_crosses();
+        }
+    }
+
+    /// A trade printed. Would it have hit one of our resting bids?
+    /// Polymarket matches a buyer of Up with a seller of Up, OR with a buyer
+    /// of Down (together they pay $1 for a new Up+Down pair). So our Up bid
+    /// at P would have been hit by:
+    ///   - a taker SELLING Up at P or below (we're 1c above the old best
+    ///     bid, so we'd have been first in line), or
+    ///   - a taker BUYING Down at 1 - P or above.
+    fn on_trade(&mut self, m: &Value) {
+        let Some(&(window, traded)) = m["asset_id"].as_str().and_then(|a| self.tokens.get(a)) else { return };
+        let num = |k: &str| m[k].as_str().and_then(|s| s.parse::<f64>().ok());
+        let (Some(price), Some(mut size)) = (num("price"), num("size")) else { return };
+        let side = m["side"].as_str().unwrap_or("");
+        let mut fills = Vec::new();
+        for (i, r) in self.resting.iter().enumerate() {
+            if r.window != window || !r.checked || self.now < r.live_from || r.remaining <= 0.0 || size <= 0.0 {
+                continue;
+            }
+            let hits = if r.outcome == traded {
+                side == "SELL" && price <= r.price + 1e-9
+            } else {
+                side == "BUY" && price >= 1.0 - r.price - 1e-9
+            };
+            if hits {
+                let n = size.min(r.remaining);
+                size -= n;
+                fills.push((i, n));
+            }
+        }
+        self.apply_maker_fills(fills);
+    }
+
+    /// Someone offered our outcome at or below our bid. In the recording
+    /// that offer just rests in the book; with our bid there, it would have
+    /// traded with us. Also: an order that's just arrived and would cross
+    /// is rejected (post-only).
+    fn check_book_crosses(&mut self) {
+        let mut fills = Vec::new();
+        for (i, r) in self.resting.iter_mut().enumerate() {
+            if self.now < r.live_from || r.remaining <= 0.0 {
+                continue;
+            }
+            let Some(w) = self.windows.get(&r.window) else { continue };
+            let book = w.book(r.outcome);
+            let crossing: f64 = book.asks.range(..=to_ticks(r.price)).map(|(_, s)| s).sum();
+            if !r.checked {
+                r.checked = true;
+                if crossing > 0.0 {
+                    r.remaining = 0.0; // post-only: would have traded at once
+                }
+                continue;
+            }
+            if crossing > 0.0 {
+                fills.push((i, crossing.min(r.remaining)));
+            }
+        }
+        // After a cross the order is done: the resting ask stays in the
+        // recorded book, so counting it again would fill us twice.
+        let done: Vec<usize> = fills.iter().map(|(i, _)| *i).collect();
+        self.apply_maker_fills(fills);
+        for i in done {
+            self.resting[i].remaining = 0.0;
+        }
+    }
+
+    fn apply_maker_fills(&mut self, fills: Vec<(usize, f64)>) {
+        for (i, n) in fills {
+            let r = &mut self.resting[i];
+            r.remaining -= n;
+            let (window, outcome, price) = (r.window, r.outcome, r.price);
+            if let Some(f) = self.paper.fill_maker(self.now, window, outcome, price, n, self.cfg.maker_fee_rate) {
+                if self.cfg.verbose {
+                    println!("{} MAKER  {:?} {} @ {:.3}", self.now, f.outcome, f.shares, f.avg_price);
+                }
             }
         }
     }
@@ -328,6 +473,11 @@ impl Sim {
         self.windows.get_mut(&start).expect("exists").forecasts.push((p_up, market));
 
         let due = self.now + self.cfg.latency_ms * 1_000_000;
+        // A decision replaces all of our resting orders in this window: the
+        // old ones are canceled, which takes effect after the latency.
+        for r in self.resting.iter_mut().filter(|r| r.window == start) {
+            r.dead_from = r.dead_from.min(due);
+        }
         for intent in self.strat.decide(&view) {
             if self.cfg.verbose {
                 println!(
@@ -336,7 +486,19 @@ impl Sim {
                     seconds_left, spot - open
                 );
             }
-            self.pending.push(Pending { due, window: start, intent });
+            if intent.maker {
+                self.resting.push(Resting {
+                    live_from: due,
+                    dead_from: u64::MAX,
+                    window: start,
+                    outcome: intent.outcome,
+                    price: intent.limit,
+                    remaining: intent.shares,
+                    checked: false,
+                });
+            } else {
+                self.pending.push(Pending { due, window: start, intent });
+            }
         }
     }
 
@@ -403,10 +565,19 @@ impl Sim {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SpotSource {
+    Coinbase,
+    Kraken,
+    Mean,
+}
+
 /// The JSON inside a websocket message, if the sim cares about this event.
 pub fn parse_message(ev: &Event) -> Option<Value> {
     match &ev.kind {
-        Kind::WsIn(text) if ev.conn == COINBASE_CONN || ev.conn == POLY_WS_CONN => serde_json::from_str(text).ok(),
+        Kind::WsIn(text) if [COINBASE_CONN, KRAKEN_CONN, POLY_WS_CONN].contains(&ev.conn) => {
+            serde_json::from_str(text).ok()
+        }
         _ => None,
     }
 }
@@ -525,6 +696,43 @@ mod tests {
         let expected = 10.0 - 4.0 - 0.12;
         assert!((r.end_cash - r.start_cash - expected).abs() < 1e-9, "{r:?}");
         assert_eq!(r.proxy_agreed, 1);
+    }
+
+    #[test]
+    fn maker_bids_fill_on_trades_and_pairs() {
+        // Model says 50/50 (spot = reference). Up trades 38/42, so the maker
+        // bids 39c for Up (11c under fair). Down trades 56/60: 57c is over
+        // fair, so no Down bid.
+        let mut evs = vec![
+            ev(999.0, 21, Kind::Other("market".into(), json!({ "start": 1000, "end": 1300, "up_token": "U", "down_token": "D" }))),
+            ev(999.5, POLY_WS_CONN, Kind::WsIn(json!([
+                { "event_type": "book", "asset_id": "U", "bids": [{"price": "0.38", "size": "100"}], "asks": [{"price": "0.42", "size": "100"}] },
+                { "event_type": "book", "asset_id": "D", "bids": [{"price": "0.56", "size": "100"}], "asks": [{"price": "0.60", "size": "100"}] },
+            ]).to_string())),
+        ];
+        evs.extend((940..1000).map(|s| ticker(s as f64 + 0.1, 70_000.0)));
+        let trade = |sec: f64, asset: &str, side: &str, price: &str, size: &str| {
+            ev(sec, POLY_WS_CONN, Kind::WsIn(json!({ "event_type": "last_trade_price", "asset_id": asset,
+                "side": side, "price": price, "size": size }).to_string()))
+        };
+        evs.extend([
+            ticker(1000.5, 70_000.0),                // decide: bid Up 39c, live at 1000.6
+            trade(1000.55, "U", "SELL", "0.38", "50"), // before our bid arrives: no fill
+            trade(1000.8, "U", "SELL", "0.38", "4"),   // a seller: hits our 39c bid first
+            trade(1000.9, "D", "BUY", "0.62", "3"),    // Down buyer at 62c >= 1 - 39c: pairs with us
+            trade(1000.95, "D", "BUY", "0.60", "50"),  // 60c < 61c: matches someone else
+            ev(1400.0, 21, Kind::Other("resolution".into(), json!({ "start": 1000, "up_won": true }))),
+        ]);
+        evs.sort_by_key(|e| e.ts);
+        let cfg = Config { strategy: "fair_value_maker".into(), edge: 0.05, ..Config::default() };
+        let mut sim = Sim::new(cfg).unwrap();
+        for e in &evs {
+            sim.update(e);
+        }
+        let r = sim.finish();
+        assert_eq!(r.fills, 2, "{r:?}");
+        // 7 shares at 39c, no maker fee, Up won: 7 * 0.61
+        assert!((r.end_cash - r.start_cash - 7.0 * 0.61).abs() < 1e-9, "{r:?}");
     }
 
     #[test]

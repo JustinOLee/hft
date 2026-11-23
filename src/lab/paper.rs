@@ -89,6 +89,25 @@ impl Paper {
         Some(fill)
     }
 
+    /// A resting (maker) order got `shares` filled at exactly `price`.
+    /// Makers pay `maker_fee_rate` (0 on Polymarket). Limited by cash.
+    pub fn fill_maker(&mut self, ts: u64, window: u64, outcome: Outcome, price: f64, shares: f64, maker_fee_rate: f64) -> Option<Fill> {
+        let per_share = price + maker_fee_rate * price * (1.0 - price);
+        let n = ((shares.min(self.cash / per_share)) * 100.0).floor() / 100.0;
+        if n <= 0.0 {
+            return None;
+        }
+        let fee = maker_fee_rate * n * price * (1.0 - price);
+        self.cash -= n * price + fee;
+        self.fees += fee;
+        let h = self.holdings.entry((window, outcome)).or_default();
+        h.shares += n;
+        h.cost += n * price + fee;
+        let fill = Fill { ts, window, outcome, shares: n, avg_price: price, fee };
+        self.fills.push(fill.clone());
+        Some(fill)
+    }
+
     /// The window is over: pay $1 per winning share. Returns the window's
     /// profit or loss (payout minus everything spent on it).
     pub fn settle(&mut self, window: u64, up_won: bool) -> f64 {

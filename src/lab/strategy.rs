@@ -47,13 +47,19 @@ pub struct View {
 }
 
 /// "Buy up to `shares` of `outcome`, paying at most `limit` per share."
-/// Simulated as an immediate-or-cancel order: whatever can't fill right
-/// away is dropped.
+///
+/// - Taker (`maker: false`): immediate-or-cancel. Whatever can't fill
+///   right away against the book is dropped. Pays the taker fee.
+/// - Maker (`maker: true`): a resting bid at exactly `limit`, "post-only"
+///   (if it would trade immediately, it's rejected instead). It waits for a
+///   seller to come to it. Each decision REPLACES all of the strategy's
+///   resting orders in the window, so returning nothing cancels them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Intent {
     pub outcome: Outcome,
     pub shares: f64,
     pub limit: f64,
+    pub maker: bool,
 }
 
 pub trait Strategy {
@@ -63,6 +69,7 @@ pub trait Strategy {
 pub fn build(cfg: &Config) -> Result<Box<dyn Strategy>, Error> {
     Ok(match cfg.strategy.as_str() {
         "fair_value_taker" => Box::new(FairValueTaker { cfg: cfg.clone() }),
+        "fair_value_maker" => Box::new(FairValueMaker { cfg: cfg.clone() }),
         "always_up" => Box::new(AlwaysUp { shares: cfg.shares }),
         "none" => Box::new(Nothing),
         other => return Err(format!("unknown strategy {other:?}").into()),
@@ -90,7 +97,7 @@ impl Strategy for AlwaysUp {
         if v.held_up > 0.0 || v.up.ask.is_none() {
             return Vec::new();
         }
-        vec![Intent { outcome: Outcome::Up, shares: self.shares, limit: 0.99 }]
+        vec![Intent { outcome: Outcome::Up, shares: self.shares, limit: 0.99, maker: false }]
     }
 }
 
@@ -119,7 +126,44 @@ impl Strategy for FairValueTaker {
             let room = c.max_shares - held;
             if fair - ask >= c.edge && room > 0.0 {
                 // Pay up to fair - edge: never more than we think it's worth.
-                out.push(Intent { outcome, shares: c.shares.min(room), limit: fair - c.edge });
+                out.push(Intent { outcome, shares: c.shares.min(room), limit: fair - c.edge, maker: false });
+            }
+        }
+        out
+    }
+}
+
+/// Market making, the simple way: rest a bid one tick (1c) above the best
+/// bid, on Up and on Down, whenever that price is still at least `edge`
+/// below fair value.
+///
+/// Why bids on BOTH sides? One Up share plus one Down share always pays
+/// exactly $1. Buy Up at 48c and Down at 48c and you've locked in 4c,
+/// whatever BTC does. In practice fills come unevenly, so you end up
+/// holding some of one side: that's inventory risk, capped by max_shares.
+///
+/// The danger is ADVERSE SELECTION: sellers who hit your bid often know
+/// BTC just moved against it. Our quotes are only as fresh as our last
+/// decision plus `latency_ms`.
+struct FairValueMaker {
+    cfg: Config,
+}
+
+impl Strategy for FairValueMaker {
+    fn decide(&mut self, v: &View) -> Vec<Intent> {
+        let c = &self.cfg;
+        if v.seconds_left < c.no_trade_last_s {
+            return Vec::new(); // cancels everything
+        }
+        let mut out = Vec::new();
+        for (outcome, fair, quote, held) in
+            [(Outcome::Up, v.p_up, v.up, v.held_up), (Outcome::Down, 1.0 - v.p_up, v.down, v.held_down)]
+        {
+            let (Some(bid), Some(ask)) = (quote.bid, quote.ask) else { continue };
+            let price = ((bid + 0.01) * 100.0).round() / 100.0;
+            let room = c.max_shares - held;
+            if price < ask - 1e-9 && fair - price >= c.edge && room > 0.0 {
+                out.push(Intent { outcome, shares: c.shares.min(room), limit: price, maker: true });
             }
         }
         out

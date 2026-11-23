@@ -107,6 +107,29 @@ def fetch_candles(first, last, path):
             t = end
 
 
+def fetch_bitstamp(first, last, path):
+    """Bitstamp 1-minute candles, saved in Coinbase's row format
+    [time, low, high, open, close, volume]. A second exchange, to test
+    whether a multi-exchange price tracks Chainlink better (RESEARCH.md E12)."""
+    have = set()
+    if os.path.exists(path):
+        with open(path) as f:
+            have = {json.loads(l)[0] for l in f}
+    with open(path, "a") as out:
+        t = first
+        while t < last:
+            if not all(s in have for s in range(t, min(t + 1000 * 60, last), 60)):
+                rows = get(f"https://www.bitstamp.net/api/v2/ohlc/btcusd/?step=60&limit=1000&start={t}")
+                for c in rows["data"]["ohlc"]:
+                    ts = int(c["timestamp"])
+                    if ts not in have and ts < last:
+                        r = [ts, float(c["low"]), float(c["high"]), float(c["open"]), float(c["close"]), float(c["volume"])]
+                        out.write(json.dumps(r) + "\n")
+                        have.add(ts)
+                time.sleep(0.2)
+            t += 1000 * 60
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=float, default=7)
@@ -137,6 +160,8 @@ def main():
 
     print("candles...", file=sys.stderr)
     fetch_candles(first_start - 3600 * 6, last_start + WINDOW + 60, f"{a.out}/candles.jsonl")
+    print("bitstamp candles...", file=sys.stderr)
+    fetch_bitstamp(first_start - 3600 * 6, last_start + WINDOW + 60, f"{a.out}/bitstamp.jsonl")
     print("done", file=sys.stderr)
 
 

@@ -12,7 +12,8 @@ use crate::Error;
 pub struct Config {
     /// Label for the results table.
     pub name: String,
-    /// Which strategy to run: "fair_value_taker", "always_up", "none".
+    /// Which strategy to run: "fair_value_taker", "fair_value_maker",
+    /// "always_up", "none".
     pub strategy: String,
 
     // ---- Money ----
@@ -22,6 +23,9 @@ pub struct Config {
     /// Polymarket's BTC 5- and 15-minute markets: 0.05 for takers, 0 for
     /// makers (docs.polymarket.com/trading/fees). Kalshi uses 0.07.
     pub fee_rate: f64,
+    /// Same formula for resting (maker) orders. Polymarket: 0. (It even
+    /// pays rebates to makers; we ignore those, to be conservative.)
+    pub maker_fee_rate: f64,
 
     // ---- Strategy ----
     /// Only buy when fair value beats the price by at least this much ($).
@@ -34,6 +38,9 @@ pub struct Config {
     pub no_trade_last_s: f64,
 
     // ---- Model ----
+    /// Which exchange(s) give the BTC price: "coinbase", "kraken", or
+    /// "mean" (their average; needs a recording with both feeds).
+    pub spot_source: String,
     /// Settlement rule the fair value assumes: "avg60" (last-minute average
     /// vs the minute-before-start average: what the market really uses) or
     /// "point" (end price vs start price: the first, simpler guess).
@@ -66,11 +73,13 @@ impl Default for Config {
             strategy: "fair_value_taker".into(),
             budget: 1000.0,
             fee_rate: 0.05,
+            maker_fee_rate: 0.0,
             edge: 0.05,
             shares: 10.0,
             max_shares: 100.0,
             no_trade_last_s: 10.0,
             model: "avg60".into(),
+            spot_source: "coinbase".into(),
             vol_halflife_s: 1800.0,
             vol_prior: 1e-4,
             first_window: 0,

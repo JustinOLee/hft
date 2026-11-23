@@ -142,6 +142,20 @@ Mostly. It's a little overconfident at the extremes (says 2.3% → actually
 3.8%; says 97.7% → actually 96.6%), consistent with fat tails or the
 Coinbase/Chainlink difference.
 
+### E12. Does a second exchange track the settlement price better?
+
+Using E2's rule with different price sources (8,619 windows):
+
+| Source | Matches official |
+|---|---|
+| Coinbase | 94.96% |
+| Bitstamp | 95.20% |
+| average of both | **95.50%** |
+
+Small but consistent: Chainlink blends many exchanges, so a blend of ours
+gets closer. That's why the recorder now also records Kraken, and the sim
+has `spot_source: mean`.
+
 ---
 
 ## Experiments on live recordings

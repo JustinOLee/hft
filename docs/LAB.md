@@ -44,7 +44,9 @@ For the strategy ideas themselves, see [STRATEGIES.md](STRATEGIES.md).
    the same rules as the trading state machine (no clock, no randomness).
    The session is read once and fed to every config, so sweeping many
    configs costs little more than one. To split train/test, set
-   `LAB_FIRST_WINDOW` / `LAB_LAST_WINDOW` (window start times).
+   `LAB_FIRST_WINDOW` / `LAB_LAST_WINDOW` (window start times), or use
+   `research/sweep.py`, which builds a grid of configs and reports a
+   train column and a test column from one pass.
 3. **Export** for analysis: `hft lab export DIR CONFIG > out.csv` writes
    one row per evaluation (model, spot, both books' tops).
 4. **History**: `research/fetch_history.py` downloads 30+ days of
@@ -102,7 +104,9 @@ All in a JSON file (see `lab/configs/`). Anything left out keeps its default.
 
 | Lever | Default | What it does | Try |
 |---|---|---|---|
-| `strategy` | `fair_value_taker` | which strategy | `always_up`, `none` |
+| `strategy` | `fair_value_taker` | which strategy | `fair_value_maker`, `always_up`, `none` |
+| `spot_source` | `coinbase` | BTC price from `coinbase`, `kraken`, or `mean` of both | `mean` (closer to Chainlink, RESEARCH.md E12) |
+| `maker_fee_rate` | 0 | fee for resting orders (Polymarket: 0, plus rebates we ignore) | |
 | `budget` | 1000 | paper dollars to start | 100, unlimited-ish 1e9 |
 | `fee_rate` | 0.05 | fee = rate × shares × p × (1−p); Polymarket's official taker rate for these markets (makers pay 0) | 0 to see the pre-fee edge; 0.07 = Kalshi |
 | `edge` | 0.05 | buy only if fair value − price ≥ this | 0.01 … 0.15 |
@@ -179,15 +183,21 @@ predicts, and only then a strategy that uses it.
       Polymarket price follow? (cross-correlation at different delays)
 - [ ] Book imbalance and recent trades (`last_trade_price` messages are
       already recorded but not used).
-- [ ] More spot feeds (Kraken, Bitstamp) to approximate the CF Benchmarks
-      index Kalshi uses.
+- [x] A second spot feed (Kraken), `spot_source: mean`
+- [ ] More spot feeds (Bitstamp, Binance.US) to get closer to Chainlink and
+      the CF Benchmarks index Kalshi uses.
 
-### Stage 5: resting orders and market making
+### Stage 5: resting orders and market making (started)
 
-- [ ] Simulate maker orders: a resting bid fills only if someone sells
-      into it, after everyone ahead of us in line. Needs a queue-position
-      guess (plan step 14).
-- [ ] A market-making strategy around fair value, with the step 10 skew.
+- [x] Simulate maker orders (`fair_value_maker`): a bid 1¢ above the best
+      bid, so nobody is ahead of us in line. It fills when a taker sells
+      Up at or below it, when a taker buys Down at or above 1 − bid
+      (Polymarket pairs those), or when someone offers at or below it.
+      Placing and canceling both take `latency_ms`, so stale quotes can be
+      picked off. Post-only: an order that would cross on arrival is
+      rejected.
+- [ ] Joining the queue at the best bid (needs a queue-position guess)
+- [ ] The step 10 skew when inventory builds up
 - [ ] Measure adverse selection: what happens to the price right after
       each of our fills?
 

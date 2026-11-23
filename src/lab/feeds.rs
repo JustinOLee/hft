@@ -1,8 +1,9 @@
 //! The lab's recorder: public market data only. No keys, no orders, no money.
 //!
-//! Two feeds, each on its own thread, each writing its own log file:
+//! Three feeds, each on its own thread, each writing its own log file:
 //!
 //!   coinbase.log.gz    BTC-USD ticker from Coinbase (the "spot" price)
+//!   kraken.log.gz      BTC/USD best bid/ask from Kraken (a second opinion)
 //!   polymarket.log.gz  order books for Polymarket's 5-minute
 //!                   "Bitcoin Up or Down" markets, plus which market is which
 //!                   ("market" events) and how each one ended ("resolution")
@@ -35,6 +36,7 @@ use crate::Error;
 
 pub const SESSION_CONN: u64 = 0;
 pub const COINBASE_CONN: u64 = 10;
+pub const KRAKEN_CONN: u64 = 11;
 pub const POLY_WS_CONN: u64 = 20;
 pub const POLY_REST_CONN: u64 = 21;
 
@@ -42,27 +44,45 @@ pub const POLY_REST_CONN: u64 = 21;
 pub const WINDOW_S: u64 = 300;
 
 const COINBASE_HOST: &str = "ws-feed.exchange.coinbase.com";
+const KRAKEN_HOST: &str = "ws.kraken.com";
 const POLY_WS_HOST: &str = "ws-subscriptions-clob.polymarket.com";
 const POLY_REST_HOST: &str = "gamma-api.polymarket.com";
 
+/// Every feed the recorder knows, in the default order.
+pub const ALL_FEEDS: &[&str] = &["coinbase", "kraken", "polymarket"];
+
 /// Record until `minutes` have passed (or forever, until Ctrl-C).
-pub fn record(dir: &str, minutes: Option<u64>) -> Result<(), Error> {
+///
+/// `feeds` picks which feeds to record. Each writes its own file, so a feed
+/// can even be added to a session that's already being recorded, by a
+/// second `hft lab record --feeds kraken` into the same folder.
+pub fn record(dir: &str, minutes: Option<u64>, feeds: &[String]) -> Result<(), Error> {
     std::fs::create_dir_all(dir)?;
     let deadline = minutes.map(|m| Instant::now() + Duration::from_secs(m * 60));
-    let mut session = EventLog::create(&format!("{dir}/session.log"))?;
-    session.write(SESSION_CONN, "start", json!({ "window_s": WINDOW_S, "minutes": minutes }))?;
-    eprintln!("recording to {dir}/ {}", minutes.map_or("until Ctrl-C".into(), |m| format!("for {m} min")));
+    // One small "start" file per recorder process (named by its start time,
+    // so a second recorder in the same folder doesn't collide).
+    let mut session = EventLog::create(&format!("{dir}/session-{}.log", now_s()))?;
+    session.write(SESSION_CONN, "start", json!({ "window_s": WINDOW_S, "minutes": minutes, "feeds": feeds }))?;
+    eprintln!("recording {feeds:?} to {dir}/ {}", minutes.map_or("until Ctrl-C".into(), |m| format!("for {m} min")));
 
-    let mut cb_log = EventLog::create(&format!("{dir}/coinbase.log.gz"))?;
-    let mut pm_log = EventLog::create(&format!("{dir}/polymarket.log.gz"))?;
-    let cb = thread::spawn(move || keep_running("coinbase", &mut cb_log, deadline, coinbase_once));
-    let mut pm = Polymarket::new();
-    let pm = thread::spawn(move || {
-        keep_running("polymarket", &mut pm_log, deadline, |log, d| pm.run_once(log, d));
-        pm.final_resolutions(&mut pm_log);
-    });
-    cb.join().map_err(|_| "coinbase thread panicked")?;
-    pm.join().map_err(|_| "polymarket thread panicked")?;
+    let mut threads = Vec::new();
+    for feed in feeds {
+        let mut log = EventLog::create(&format!("{dir}/{feed}.log.gz"))?;
+        let name = feed.clone();
+        threads.push(match feed.as_str() {
+            "coinbase" => thread::spawn(move || keep_running(&name, &mut log, deadline, coinbase_once)),
+            "kraken" => thread::spawn(move || keep_running(&name, &mut log, deadline, kraken_once)),
+            "polymarket" => thread::spawn(move || {
+                let mut pm = Polymarket::new();
+                keep_running(&name, &mut log, deadline, |log, d| pm.run_once(log, d));
+                pm.final_resolutions(&mut log);
+            }),
+            other => return Err(format!("unknown feed {other:?} (known: {ALL_FEEDS:?})").into()),
+        });
+    }
+    for t in threads {
+        t.join().map_err(|_| "a recorder thread panicked")?;
+    }
     eprintln!("done: {dir}/");
     Ok(())
 }
@@ -146,6 +166,25 @@ fn coinbase_once(log: &mut EventLog, deadline: Option<Instant>) -> Result<(), Er
     while !past(deadline) {
         if let Some(text) = ws_read(log, COINBASE_CONN, &mut ws)? {
             log.write(COINBASE_CONN, "ws_in", json!(text))?;
+        }
+    }
+    ws_close(&mut ws);
+    Ok(())
+}
+
+// ---- Kraken ----------------------------------------------------------------
+
+/// A second spot exchange. Chainlink's settlement price blends many
+/// exchanges, and a blend of two tracked it better than either alone
+/// (RESEARCH.md, E12).
+fn kraken_once(log: &mut EventLog, deadline: Option<Instant>) -> Result<(), Error> {
+    let mut ws = ws_connect(log, KRAKEN_CONN, KRAKEN_HOST, "/v2")?;
+    // "ticker" sends the best bid/ask whenever they change.
+    let sub = json!({ "method": "subscribe", "params": { "channel": "ticker", "symbol": ["BTC/USD"], "event_trigger": "bbo" } });
+    ws_send(log, KRAKEN_CONN, &mut ws, sub.to_string())?;
+    while !past(deadline) {
+        if let Some(text) = ws_read(log, KRAKEN_CONN, &mut ws)? {
+            log.write(KRAKEN_CONN, "ws_in", json!(text))?;
         }
     }
     ws_close(&mut ws);

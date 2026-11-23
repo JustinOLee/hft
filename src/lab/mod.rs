@@ -1,6 +1,6 @@
 //! The lab: a playground for prediction ideas. Real data, paper money.
 //!
-//!   hft lab record [--minutes N] [DIR]      save live public data to DIR
+//!   hft lab record [--minutes N] [--feeds a,b] [DIR]   save live public data
 //!   hft lab backtest [-v] DIR CONFIG...     run each config over DIR
 //!   hft lab export DIR CONFIG > out.csv     one CSV row per evaluation
 //!
@@ -32,22 +32,24 @@ use crate::eventlog::now_nanos;
 use crate::queue::EventReader;
 use crate::Error;
 
-const USAGE: &str = "usage: hft lab record [--minutes N] [DIR]\n       hft lab backtest [-v] DIR CONFIG.json...\n       hft lab export DIR CONFIG.json > out.csv";
+const USAGE: &str = "usage: hft lab record [--minutes N] [--feeds coinbase,kraken,polymarket] [DIR]\n       hft lab backtest [-v] DIR CONFIG.json...\n       hft lab export DIR CONFIG.json > out.csv";
 
 pub fn cli(args: &[String]) -> Result<(), Error> {
     match args.first().map(String::as_str) {
         Some("record") => {
             let mut minutes = None;
             let mut dir = None;
+            let mut list: Vec<String> = feeds::ALL_FEEDS.iter().map(|s| s.to_string()).collect();
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--minutes" => minutes = Some(it.next().ok_or(USAGE)?.parse()?),
+                    "--feeds" => list = it.next().ok_or(USAGE)?.split(',').map(String::from).collect(),
                     d => dir = Some(d.to_string()),
                 }
             }
             let dir = dir.unwrap_or_else(|| format!("data/{}", now_nanos() / 1_000_000_000));
-            feeds::record(&dir, minutes)
+            feeds::record(&dir, minutes, &list)
         }
         Some("backtest") => {
             let verbose = args.iter().any(|a| a == "-v");
